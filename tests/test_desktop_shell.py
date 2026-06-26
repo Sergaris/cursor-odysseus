@@ -83,14 +83,19 @@ def test_run_desktop_app_starts_tray_in_background_before_webview():
     mock_window.events = SimpleNamespace(
         closed=_EventHandlers(),
         loaded=_EventHandlers(),
+        closing=_EventHandlers(),
     )
     mock_webview = mock.Mock()
     mock_webview.create_window.return_value = mock_window
     tray_calls: list[tuple] = []
     webview_started = threading.Event()
+    shutdown_calls: list[str] = []
 
     def fake_tray(url: str, window) -> None:
         tray_calls.append((url, window))
+
+    def fake_shutdown() -> None:
+        shutdown_calls.append("shutdown")
 
     def fake_start(*, gui=None) -> None:
         webview_started.set()
@@ -104,12 +109,14 @@ def test_run_desktop_app_starts_tray_in_background_before_webview():
     try:
         real_thread = threading.Thread
         with mock.patch("desktop_shell._import_webview", return_value=mock_webview), \
-             mock.patch("desktop_shell.threading.Thread", side_effect=real_thread):
+             mock.patch("desktop_shell.threading.Thread", side_effect=real_thread), \
+             mock.patch("src.desktop_shutdown.is_shutdown_done", return_value=False):
             run_desktop_app(
                 url=f"http://{host}:{port}/",
                 start_server=lambda: None,
                 close_splash=lambda: None,
                 setup_system_tray=fake_tray,
+                shutdown_app=fake_shutdown,
             )
     finally:
         server.shutdown()
@@ -117,3 +124,4 @@ def test_run_desktop_app_starts_tray_in_background_before_webview():
     assert tray_calls
     assert webview_started.is_set()
     mock_webview.start.assert_called_once()
+    assert shutdown_calls == ["shutdown"]

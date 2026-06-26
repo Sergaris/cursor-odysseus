@@ -167,7 +167,7 @@ def run_desktop_app(
         except Exception:
             logger.exception("Не удалось активировать окно Odysseus")
 
-    def _shutdown_on_close() -> None:
+    def _request_shutdown() -> None:
         nonlocal _shutdown_requested
         if _shutdown_requested:
             return
@@ -177,9 +177,15 @@ def run_desktop_app(
         else:
             os._exit(0)
 
+    def _on_closing() -> bool:
+        _request_shutdown()
+        return True
+
     _shutdown_requested = False
 
-    window.events.closed += _shutdown_on_close
+    if hasattr(window.events, "closing"):
+        window.events.closing += _on_closing
+    window.events.closed += _request_shutdown
 
     _window_focused = False
 
@@ -192,10 +198,18 @@ def run_desktop_app(
 
     window.events.loaded += _focus_window_once
     gui = "edgechromium" if sys.platform == "win32" else None
-    if gui is not None:
-        webview.start(gui=gui)
-    else:
-        webview.start()
+    try:
+        if gui is not None:
+            webview.start(gui=gui)
+        else:
+            webview.start()
+    finally:
+        if not _shutdown_requested:
+            logger.info("Окно закрыто — выполняем shutdown")
+            if shutdown_app is not None:
+                shutdown_app()
+            else:
+                os._exit(0)
 
     if server_error:
         raise server_error[0]

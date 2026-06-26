@@ -1,5 +1,6 @@
 """Graceful shutdown for the Odysseus desktop shell (Windows)."""
 
+import asyncio
 import json
 import logging
 import os
@@ -12,8 +13,17 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 GRACEFUL_SHUTDOWN_TIMEOUT_SEC = 15.0
+CURSOR_SDK_SHUTDOWN_TIMEOUT_SEC = 12.0
 _shutdown_lock = threading.Lock()
 _shutdown_done = False
+
+# Подпроцессы Odysseus, которые могут пережить родителя (bridge node, MCP worker).
+_ORPHAN_CMD_MARKERS = (
+    "cursor_sdk/_vendor/bridge",
+    "cursor_sdk\\_vendor\\bridge",
+    "mcp_servers/",
+    "mcp_servers\\",
+)
 
 
 class UvicornServerController:
@@ -54,6 +64,11 @@ class UvicornServerController:
                     "Uvicorn не завершился за %.1f с — будут завершены дочерние процессы",
                     timeout_sec,
                 )
+
+
+def is_shutdown_done() -> bool:
+    """True, если shutdown уже выполнялся."""
+    return _shutdown_done
 
 
 def get_process_cleanup_markers() -> tuple[str, ...]:
@@ -115,8 +130,16 @@ def _is_descendant(pid: int, ancestor: int, parent_map: dict[int, int]) -> bool:
     return False
 
 
+def _cmd_matches_install(cmd: str, marker_cases: tuple[str, ...]) -> bool:
+    return bool(cmd) and any(marker in cmd for marker in marker_cases)
+
+
+def _cmd_is_orphan_child(cmd: str) -> bool:
+    return any(marker in cmd for marker in _ORPHAN_CMD_MARKERS)
+
+
 def collect_straggler_pids(root_pid: int, markers: tuple[str, ...]) -> set[int]:
-    """Find child processes owned by this Odysseus instance."""
+    """Find Odysseus-owned child/orphan processes for this install."""
     if sys.platform != "win32" or not markers:
         return set()
     processes = _list_win32_processes()
@@ -133,12 +156,13 @@ def collect_straggler_pids(root_pid: int, markers: tuple[str, ...]) -> set[int]:
         pid = int(item.get("ProcessId", 0) or 0)
         if pid in {0, root_pid}:
             continue
-        if not _is_descendant(pid, root_pid, parent_map):
-            continue
         cmd = os.path.normcase(str(item.get("CommandLine") or ""))
-        if not cmd:
+        is_child = _is_descendant(pid, root_pid, parent_map)
+        if is_child:
+            # Любой потомок (WebView2, MCP worker, bridge node, дочерний exe).
+            stragglers.add(pid)
             continue
-        if any(marker in cmd for marker in marker_cases):
+        if _cmd_matches_install(cmd, marker_cases) and _cmd_is_orphan_child(cmd):
             stragglers.add(pid)
     return stragglers
 
@@ -146,7 +170,7 @@ def collect_straggler_pids(root_pid: int, markers: tuple[str, ...]) -> set[int]:
 def _terminate_pid(pid: int) -> None:
     if sys.platform == "win32":
         subprocess.run(
-            ["taskkill", "/PID", str(pid), "/F"],
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -157,6 +181,40 @@ def _terminate_pid(pid: int) -> None:
         os.kill(pid, 15)
     except OSError:
         pass
+
+
+def _shutdown_cursor_sdk_sync() -> None:
+    """Закрывает Cursor SDK bridge в отдельном asyncio loop (не блокируется uvicorn)."""
+    from src.cursor_sdk.async_runtime import shutdown_async_clients
+
+    errors: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            asyncio.run(shutdown_async_clients())
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(
+        target=_run,
+        name="cursor-sdk-shutdown",
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=CURSOR_SDK_SHUTDOWN_TIMEOUT_SEC)
+    if thread.is_alive():
+        logger.warning("Cursor SDK shutdown не завершился за %.1f с", CURSOR_SDK_SHUTDOWN_TIMEOUT_SEC)
+    if errors:
+        logger.warning("Cursor SDK shutdown error: %s", errors[0])
+
+
+def _release_desktop_instance_lock() -> None:
+    try:
+        from src.desktop_single_instance import release_primary_instance
+
+        release_primary_instance()
+    except Exception as exc:
+        logger.debug("Instance lock release skipped: %s", exc)
 
 
 def cleanup_straggler_processes(root_pid: int | None = None) -> int:
@@ -184,6 +242,8 @@ def shutdown_odysseus_desktop(
         _shutdown_done = True
         logger.info("Завершение Odysseus desktop...")
 
+    root_pid = os.getpid()
+
     if stop_tray is not None:
         try:
             stop_tray()
@@ -196,5 +256,7 @@ def shutdown_odysseus_desktop(
         except Exception:
             logger.exception("Ошибка остановки uvicorn")
 
-    cleanup_straggler_processes()
+    _shutdown_cursor_sdk_sync()
+    cleanup_straggler_processes(root_pid)
+    _release_desktop_instance_lock()
     os._exit(0)

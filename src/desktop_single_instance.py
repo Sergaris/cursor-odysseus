@@ -86,3 +86,25 @@ def claim_primary_instance() -> bool:
 def ensure_single_desktop_instance() -> bool:
     """Exit early when a desktop instance is already running."""
     return claim_primary_instance()
+
+
+def release_primary_instance() -> None:
+    """Освобождает mutex и socket lock при завершении desktop-процесса."""
+    global _PRIMARY_MUTEX_HANDLE, _INSTANCE_LOCK_SOCKET
+
+    if _INSTANCE_LOCK_SOCKET is not None:
+        try:
+            _INSTANCE_LOCK_SOCKET.close()
+        except Exception as exc:
+            logger.debug("Не удалось закрыть instance socket: %s", exc)
+        _INSTANCE_LOCK_SOCKET = None
+
+    if _PRIMARY_MUTEX_HANDLE is None:
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.CloseHandle(_PRIMARY_MUTEX_HANDLE)
+    except Exception as exc:
+        logger.debug("Не удалось закрыть instance mutex: %s", exc)
+    _PRIMARY_MUTEX_HANDLE = None
