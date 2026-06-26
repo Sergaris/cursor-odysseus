@@ -15,6 +15,7 @@ from src.cursor_sdk.tool_runtime import (
     resolve_runtime,
 )
 from src.tool_schemas import FUNCTION_TOOL_SCHEMAS
+from src.tool_content import normalize_tool_content
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +118,8 @@ def _make_execute_handler(tool_name: str, runtime_holder: RuntimeHolder | None):
             return {"content": [{"type": "text", "text": text}], "isError": True}
 
         cmd = _command_display(tool_name, args)
-        content = json.dumps(dict(args), ensure_ascii=False) if args else ""
+        raw_content = json.dumps(dict(args), ensure_ascii=False) if args else ""
+        content = normalize_tool_content(tool_name, raw_content)
         block = ToolBlock(tool_name, content)
 
         await runtime.events.put(

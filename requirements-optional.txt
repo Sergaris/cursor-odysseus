@@ -38,3 +38,7 @@ markitdown[docx,pptx,xlsx,xls]==0.1.6
 # Cursor SDK — programmatic access to Composer for Deep Research brain provider.
 # Optional: without it, Settings → Research shows a clear install hint on probe.
 cursor-sdk
+
+# Matplotlib for agent python tool charts (headless Agg backend).
+# numpy is already in requirements.txt.
+matplotlib

@@ -21,11 +21,18 @@ Handles:
 import os
 import sys
 
-# MCP worker subprocess: Odysseus.exe mcp_servers/foo.py — run script only, no GUI.
+# Subprocess modes: python tool script or MCP server — no GUI.
 try:
-    from src.subprocess_entry import is_mcp_worker_argv, run_mcp_worker_if_requested
+    from src.subprocess_entry import (
+        is_mcp_worker_argv,
+        is_python_worker_argv,
+        run_mcp_worker_if_requested,
+        run_python_worker_if_requested,
+    )
 
-    if is_mcp_worker_argv():
+    if is_python_worker_argv():
+        run_python_worker_if_requested()
+    elif is_mcp_worker_argv():
         run_mcp_worker_if_requested()
 except Exception:
     pass
@@ -70,8 +77,8 @@ def _enforce_single_desktop_instance() -> None:
         return
     if not getattr(sys, "frozen", False) and not should_use_desktop_shell():
         return
-    from src.subprocess_entry import is_mcp_worker_argv
-    if is_mcp_worker_argv():
+    from src.subprocess_entry import is_mcp_worker_argv, is_python_worker_argv
+    if is_python_worker_argv() or is_mcp_worker_argv():
         return
     from src.desktop_single_instance import ensure_single_desktop_instance
     if not ensure_single_desktop_instance():

@@ -3,10 +3,12 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('static', 'static'), ('scripts', 'scripts'), ('mcp_servers', 'mcp_servers'), ('services/hwfit/data', 'services/hwfit/data'), ('config', 'config'), ('.env.example', '.env.example')]
 binaries = []
-hiddenimports = ['desktop_shell', 'src.desktop_shutdown', 'src.frozen_runtime', 'src.desktop_single_instance', 'src.subprocess_entry', 'webview', 'webview.platforms.edgechromium']
+hiddenimports = ['desktop_shell', 'src.desktop_shutdown', 'src.frozen_runtime', 'src.desktop_single_instance', 'src.subprocess_entry', 'src.tool_content', 'src.python_runtime', 'webview', 'webview.platforms.edgechromium']
 tmp_ret = collect_all('cursor_sdk')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('webview')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('matplotlib')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 

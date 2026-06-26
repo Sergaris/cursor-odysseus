@@ -23,6 +23,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 from src.tool_security import is_public_blocked_tool, owner_is_admin_or_single_user
 from src.tool_policy import ToolPolicy
+from src.tool_content import build_mcp_args_from_content, normalize_tool_content, parse_tool_json_payload
 from src.constants import MAX_OUTPUT_CHARS, MAX_READ_CHARS, MAX_DIFF_LINES, DATA_DIR
 from src.tool_utils import _truncate, get_mcp_manager
 
@@ -323,6 +324,16 @@ _MCP_TOOL_MAP = {
     "web_fetch":      ("web_fetch",  "web_fetch"),
     "generate_image": ("image_gen",  "generate_image"),
 }
+
+# Native handlers in TOOL_HANDLERS — prefer direct execution over MCP servers.
+_DIRECT_NATIVE_TOOLS = frozenset({
+    "bash",
+    "python",
+    "web_search",
+    "web_fetch",
+    "read_file",
+    "write_file",
+})
 _EMAIL_MCP_OWNER_ARG = "_odysseus_owner"
 
 
@@ -392,8 +403,7 @@ _MCP_ARG_PARSERS: Dict[str, Callable[[str], Dict[str, str]]] = {
 
 def _build_mcp_args(tool: str, content: str) -> Dict:
     """Convert fenced-block text content to structured MCP arguments."""
-    parser = _MCP_ARG_PARSERS.get(tool)
-    return parser(content) if parser else {}
+    return build_mcp_args_from_content(tool, content)
 
 
 async def _call_mcp_tool(
@@ -402,6 +412,13 @@ async def _call_mcp_tool(
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
 ) -> Dict:
     """Route a legacy tool call through the MCP manager, with direct fallbacks."""
+    content = normalize_tool_content(tool, content)
+    if tool in _DIRECT_NATIVE_TOOLS:
+        fallback = await _direct_fallback(tool, content, progress_cb=progress_cb)
+        if fallback is not None:
+            return fallback
+        return {"error": f"{tool}: execution failed", "exit_code": 1}
+
     mcp = get_mcp_manager()
     if not mcp:
         return await _direct_fallback(tool, content, progress_cb=progress_cb) or {"error": f"MCP manager not available for tool '{tool}'", "exit_code": 1}
@@ -474,6 +491,7 @@ async def _direct_fallback(
     session_id: Optional[str] = None,
     owner: Optional[str] = None,
 ) -> Optional[Dict]:
+    content = normalize_tool_content(tool, content)
     _subproc_env = {
         **os.environ,
         "TERM": "xterm-256color",
@@ -577,33 +595,36 @@ async def _execute_tool_block_impl(
     )
 
     tool = block.tool_type
-    content = block.content
+    content = normalize_tool_content(tool, block.content)
 
     # Misformatted tool call detection: model put JSON inside ```python``` (or
     # similar) without naming the tool. Common with MiniMax-style outputs.
-    # Return a helpful error so the model retries with the correct format.
-    if tool in ("python", "json", "xml") and content.strip().startswith("{") and content.strip().endswith("}"):
-        try:
-            parsed = json.loads(content.strip())
-            if isinstance(parsed, dict):
-                desc = f"{tool}: misformatted tool call"
-                result = {
-                    "error": (
-                        f"You wrote a JSON object inside a ```{tool}``` block, but that's not a tool call.\n"
-                        "To call a tool, use the tool name as the fence tag, e.g.\n"
-                        "```resolve_contact\n"
-                        "{\"name\": \"...\"}\n"
-                        "```\n"
-                        "or\n"
-                        "```send_email\n"
-                        "{\"to\": \"...\", \"subject\": \"...\", \"body\": \"...\"}\n"
-                        "```"
-                    ),
-                    "exit_code": 1,
-                }
-                return desc, result
-        except (ValueError, TypeError):
-            pass
+    # Cursor SDK / function-calling payloads like {"code": "..."} are valid.
+    raw_content = (block.content or "").strip()
+    if tool in ("python", "json", "xml") and raw_content.startswith("{") and raw_content.endswith("}"):
+        parsed = parse_tool_json_payload(raw_content)
+        is_valid_python_payload = (
+            tool == "python"
+            and isinstance(parsed, dict)
+            and "code" in parsed
+        )
+        if isinstance(parsed, dict) and not is_valid_python_payload:
+            desc = f"{tool}: misformatted tool call"
+            result = {
+                "error": (
+                    f"You wrote a JSON object inside a ```{tool}``` block, but that's not a tool call.\n"
+                    "To call a tool, use the tool name as the fence tag, e.g.\n"
+                    "```resolve_contact\n"
+                    "{\"name\": \"...\"}\n"
+                    "```\n"
+                    "or\n"
+                    "```send_email\n"
+                    "{\"to\": \"...\", \"subject\": \"...\", \"body\": \"...\"}\n"
+                    "```"
+                ),
+                "exit_code": 1,
+            }
+            return desc, result
 
     # Reject tools that the user has disabled for this request
     if disabled_tools and tool in disabled_tools:

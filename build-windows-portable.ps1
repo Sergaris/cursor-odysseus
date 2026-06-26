@@ -75,10 +75,13 @@ $pyInstallerArgs = @(
     "--hidden-import=src.frozen_runtime",
     "--hidden-import=src.desktop_single_instance",
     "--hidden-import=src.subprocess_entry",
+    "--hidden-import=src.tool_content",
+    "--hidden-import=src.python_runtime",
     "--hidden-import=webview",
     "--hidden-import=webview.platforms.edgechromium",
     "--collect-all", "cursor_sdk",
-    "--collect-all", "webview"
+    "--collect-all", "webview",
+    "--collect-all", "matplotlib"
 ) + $dataArgs + @("launcher.py")
 
 & $pyExe -m PyInstaller @pyInstallerArgs
