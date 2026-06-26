@@ -209,10 +209,18 @@ class DeepResearcher:
         progress_callback: Optional[Callable] = None,
         search_provider: Optional[str] = None,
         category: Optional[str] = None,
+        cursor_backend=None,
+        extract_llm_endpoint: Optional[str] = None,
+        extract_llm_model: Optional[str] = None,
+        extract_llm_headers: Optional[Dict] = None,
     ):
         self.llm_endpoint = llm_endpoint
         self.llm_model = llm_model
         self.llm_headers = llm_headers
+        self._cursor_backend = cursor_backend
+        self.extract_llm_endpoint = (extract_llm_endpoint or "").strip() or None
+        self.extract_llm_model = (extract_llm_model or "").strip() or None
+        self.extract_llm_headers = extract_llm_headers
         self.search_provider_override = search_provider
         self.category = category
         self.max_rounds = max_rounds
@@ -381,6 +389,15 @@ class DeepResearcher:
     async def _llm(self, messages: List[Dict], temperature: float = 0.3,
                    max_tokens: int = 4096, timeout: int = 60) -> str:
         """Call the LLM asynchronously and strip thinking tags."""
+        if self._cursor_backend is not None:
+            response = await self._cursor_backend.complete(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+            )
+            return strip_thinking(response)
+
         from src.llm_core import llm_call_async
         response = await llm_call_async(
             url=self.llm_endpoint,
@@ -389,6 +406,29 @@ class DeepResearcher:
             temperature=temperature,
             max_tokens=max_tokens,
             headers=self.llm_headers,
+            timeout=timeout,
+        )
+        return strip_thinking(response)
+
+    async def _llm_extract(self, messages: List[Dict], temperature: float = 0.2,
+                           max_tokens: int = 2048, timeout: int = 60) -> str:
+        """Per-URL extraction LLM — HTTP endpoint when hybrid mode is configured."""
+        if not self.extract_llm_endpoint or not self.extract_llm_model:
+            return await self._llm(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+            )
+
+        from src.llm_core import llm_call_async
+        response = await llm_call_async(
+            url=self.extract_llm_endpoint,
+            model=self.extract_llm_model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            headers=self.extract_llm_headers,
             timeout=timeout,
         )
         return strip_thinking(response)
@@ -633,7 +673,7 @@ class DeepResearcher:
                 content = truncated
 
         try:
-            response = await self._llm(
+            response = await self._llm_extract(
                 [
                     {"role": "user", "content": EXTRACTOR_SYSTEM.format(goal=question)},
                     untrusted_context_message("webpage", content),

@@ -9,6 +9,7 @@ import { providerLogo } from './providers.js';
 import { initModelPicker, updateModelPicker } from './modelPicker.js';
 import themeModule from './theme.js';
 import spinnerModule from './spinner.js';
+import { openResearchReport } from './researchReport.js';
 
 const API_BASE = window.location.origin;
 
@@ -2928,14 +2929,14 @@ async function _renderLibResearch(grid) {
       if (metaEl) metaEl.textContent = metaEl.textContent.replace(/\d+ msgs?/, (item.source_count || 0) + ' sources');
       card.addEventListener('click', (e) => {
         if (e.target.closest('.archive-menu-btn') || e.target.closest('.memory-select-cb')) return;
-        window.open(`${API_BASE}/api/research/report/${item.id}`, '_blank');
+        openResearchReport(item.id);
       });
       const menuBtn = card.querySelector('.archive-menu-btn');
       if (menuBtn) {
         menuBtn.addEventListener('click', (e) => {
           e.stopPropagation();
           _showDropdown(e.currentTarget, [
-            { label: 'Open Report', action: () => window.open(`${API_BASE}/api/research/report/${item.id}`, '_blank') },
+            { label: 'Open Report', action: () => openResearchReport(item.id) },
             { label: 'Re-run', action: () => {
               const modal = document.getElementById('library-modal');
               if (modal) modal.style.display = 'none';

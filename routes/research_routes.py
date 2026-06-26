@@ -42,6 +42,13 @@ def _first_chat_model(models) -> str:
 
 def _resolve_research_endpoint(sess, owner: Optional[str] = None) -> tuple:
     """Return (endpoint_url, model, headers) for Deep Research, checking admin overrides."""
+    from src.settings import get_setting
+
+    if get_setting("research_brain_provider", "http") == "cursor_sdk":
+        from src.cursor_sdk.provider import CURSOR_SDK_BASE_URL
+        model = (get_setting("research_brain_model", "composer-2.5") or "composer-2.5").strip()
+        return CURSOR_SDK_BASE_URL, model, {}
+
     owner = owner or getattr(sess, "owner", None) or None
     url, model, headers = resolve_endpoint(
         "research",
@@ -208,6 +215,18 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
             raise HTTPException(404, "Research not found")
         if owner != user:
             raise HTTPException(404, "Research not found")
+
+    @router.get("/api/research/report-link/{session_id}")
+    async def research_report_link(session_id: str, request: Request):
+        """Signed URL for in-app visual report viewer (iframe overlay)."""
+        user = _require_user(request)
+        _validate_session_id(session_id)
+        _assert_owns_research(session_id, user)
+        from src.research_report_access import sign_report_access
+
+        token = sign_report_access(session_id, user)
+        path = f"/api/research/report/{session_id}?access={token}"
+        return {"url": path, "path": path}
 
     @router.get("/api/research/report/{session_id}")
     async def research_report(session_id: str, request: Request):
@@ -403,7 +422,15 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
                 user = tool_owner
         session_id = f"rp-{uuid.uuid4().hex[:12]}"
 
-        if body.endpoint_id:
+        from src.settings import get_setting
+        if get_setting("research_brain_provider", "http") == "cursor_sdk":
+            from src.cursor_sdk.provider import CURSOR_SDK_BASE_URL
+            ep_url = CURSOR_SDK_BASE_URL
+            ep_model = (get_setting("research_brain_model", "composer-2.5") or "composer-2.5").strip()
+            if body.model:
+                ep_model = body.model
+            ep_headers = {}
+        elif body.endpoint_id:
             from src.database import SessionLocal
             db = SessionLocal()
             try:

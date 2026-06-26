@@ -27,12 +27,29 @@ _NON_CHAT_MODEL = (
 )
 
 
-def _first_chat_model(models) -> Optional[str]:
+def _first_chat_model(models, base_url: str = "") -> Optional[str]:
     """First model that isn't an embedding/tts/etc.; falls back to models[0]."""
-    for m in (models or []):
+    from src.cursor_sdk.provider import (
+        is_cursor_sdk_base,
+        is_cursor_sdk_routing_alias,
+    )
+
+    candidates = list(models or [])
+    if is_cursor_sdk_base(base_url):
+        for m in candidates:
+            if (m or "").strip() == "default":
+                return "default"
+        from src.cursor_sdk.provider import filter_cursor_sdk_model_ids
+
+        concrete = filter_cursor_sdk_model_ids(
+            [m for m in candidates if not is_cursor_sdk_routing_alias(m)]
+        )
+        candidates = concrete or candidates
+
+    for m in candidates:
         if not any(p in str(m).lower() for p in _NON_CHAT_MODEL):
             return m
-    return (models[0] if models else None)
+    return (candidates[0] if candidates else None)
 
 
 def _endpoint_cached_models(ep) -> list:
@@ -151,7 +168,13 @@ def resolve_url(url: str) -> str:
 
 def normalize_base(url: str) -> str:
     """Strip known API path suffixes from a base URL."""
-    url = (url or "").strip().rstrip("/")
+    from src.cursor_sdk.provider import is_cursor_sdk_base
+
+    raw = (url or "").strip()
+    if is_cursor_sdk_base(raw):
+        return raw.split("#", 1)[0]
+
+    url = raw.rstrip("/")
     for suffix in ["/models", "/chat/completions", "/completions", "/v1/messages", "/responses"]:
         if url.endswith(suffix):
             url = url[: -len(suffix)].rstrip("/")
@@ -170,6 +193,10 @@ def _validated_endpoint_base(url: str) -> str:
 
 
 def _prepare_endpoint_base(base: str) -> str:
+    from src.cursor_sdk.provider import is_cursor_sdk_base
+
+    if is_cursor_sdk_base(base):
+        return (base or "").strip()
     base = _validated_endpoint_base(normalize_base(base))
     return _validated_endpoint_base(normalize_base(resolve_url(base)))
 
@@ -199,6 +226,8 @@ def build_chat_url(base: str) -> str:
     """Return the correct chat endpoint URL for a given base."""
     base = _prepare_endpoint_base(base)
     provider = _detect_provider(base)
+    if provider == "cursor-sdk":
+        return base
     if provider == "anthropic":
         return _append_endpoint_path(_anthropic_api_root(base), "/v1/messages")
     if provider == "ollama":
@@ -223,6 +252,8 @@ def build_models_url(base: str) -> Optional[str]:
     """
     base = _prepare_endpoint_base(base)
     provider = _detect_provider(base)
+    if provider == "cursor-sdk":
+        return None
     if provider == "anthropic":
         return _append_endpoint_path(_anthropic_api_root(base), "/v1/models")
     if provider == "ollama":
@@ -257,6 +288,13 @@ def build_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
     if provider == "chatgpt-subscription":
         from src.chatgpt_subscription import chatgpt_headers
         return chatgpt_headers(api_key)
+    if provider == "cursor-sdk":
+        from src.cursor_sdk.auth import CursorSDKAuthError, resolve_api_key
+        try:
+            key = resolve_api_key(api_key)
+            return {"X-Cursor-Api-Key": key}
+        except CursorSDKAuthError:
+            return {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     if provider == "openrouter":
@@ -349,7 +387,7 @@ def resolve_endpoint(
             model = ""
         # If no (usable) model specified, pick the first enabled chat model.
         if not model:
-            model = _first_chat_model(_endpoint_enabled_models(ep)) or ""
+            model = _first_chat_model(_endpoint_enabled_models(ep), getattr(ep, "base_url", "") or "") or ""
         if not model and not fallback_model:
             logger.warning('[resolve_endpoint] no usable model (all models hidden or list empty)')
 
@@ -396,7 +434,7 @@ def resolve_endpoint_by_id(
         if m and m in _endpoint_hidden_models(ep):
             m = ""
         if not m:
-            m = _first_chat_model(_endpoint_enabled_models(ep)) or ""
+            m = _first_chat_model(_endpoint_enabled_models(ep), getattr(ep, "base_url", "") or "") or ""
         if not m:
             return None
         return chat_url, m, headers

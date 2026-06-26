@@ -10,6 +10,7 @@ import { topPortalZ } from './toolWindowZOrder.js';
 import { sortModelIds } from './modelSort.js';
 import { ordinalSuffix } from './util/ordinal.js';
 import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
+import { openResearchReport } from './researchReport.js';
 
 const API_BASE = window.location.origin;
 let _open = false;
@@ -2047,7 +2048,7 @@ function _wireActivityRows(list) {
       e.stopPropagation();
       const idx = parseInt(row.dataset.entryIdx, 10);
       const entry = _activityEntries[idx];
-      if (entry?.researchId) window.open(`${API_BASE}/api/research/report/${encodeURIComponent(entry.researchId)}`, '_blank');
+      if (entry?.researchId) openResearchReport(entry.researchId);
     });
     row.querySelector('.task-log-force-run')?.addEventListener('click', (e) => {
       e.stopPropagation();

@@ -529,6 +529,11 @@ class SessionManager:
                 # Commit the document-detach / message-delete above (a no-op when
                 # the ghost had no rows) together with the session delete.
                 db.commit()
+                try:
+                    from src.cursor_sdk.stream_bridge import release_chat_session
+                    release_chat_session(session_id)
+                except Exception as exc:
+                    logger.warning("Cursor SDK chat release failed for %s: %s", session_id, exc)
                 logger.info(f"Deleted session {session_id}")
                 return True
             return False

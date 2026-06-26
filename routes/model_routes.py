@@ -41,6 +41,7 @@ _ENDPOINT_SETTING_FIELDS = {
     "default_endpoint_id":  ("default_model",  "Default Model"),
     "utility_endpoint_id":  ("utility_model",   "Utility Model"),
     "research_endpoint_id": ("research_model",  "Deep Research"),
+    "research_extract_endpoint_id": ("research_extract_model", "Research Extract (hybrid)"),
     "task_endpoint_id":     ("task_model",       "Background Tasks"),
 }
 
@@ -602,9 +603,37 @@ def _resolve_probe_key(ep) -> Optional[str]:
         return None
 
 
+def _probe_cursor_sdk_model(base_url: str, api_key: str | None, model_id: str, timeout: int = 10) -> dict:
+    """Probe a Cursor SDK model with a short completion."""
+    from src.cursor_sdk.backend import CursorSDKBackend
+    from src.cursor_sdk.model_discovery import _run_on_loop
+    from src.cursor_sdk.provider import is_cursor_sdk_routing_alias, normalize_cursor_sdk_model, resolve_cursor_sdk_cwd
+
+    if is_cursor_sdk_routing_alias(model_id):
+        return {"status": "ok", "latency_ms": 0, "skipped": True, "alias": model_id}
+
+    async def _run() -> None:
+        backend = CursorSDKBackend(
+            model=normalize_cursor_sdk_model(model_id),
+            cwd=resolve_cursor_sdk_cwd(base_url),
+            api_key=api_key,
+            scope="ephemeral",
+        )
+        await backend.probe(timeout=timeout)
+
+    t0 = _time.time()
+    try:
+        _run_on_loop(_run(), timeout=max(10, int(timeout or 10) + 5))
+        return {"status": "ok", "latency_ms": round((_time.time() - t0) * 1000)}
+    except Exception as exc:
+        return {"status": "fail", "error": str(exc)[:120]}
+
+
 def _probe_single_model(base: str, api_key: str, model_id: str, timeout: int = 10, with_tools: bool = False) -> dict:
     """Send a realistic completion request to a single model. Returns {status, latency_ms, error?}."""
     provider = _safe_detect_provider(base)
+    if provider == "cursor-sdk":
+        return _probe_cursor_sdk_model(base, api_key, model_id, timeout=timeout)
     if _is_discovery_only_provider(provider):
         return {"status": "ok", "latency_ms": 0, "skipped": True}
     messages = [
@@ -690,6 +719,10 @@ def _classify_endpoint(base_url: str, endpoint_kind: str = "auto") -> str:
     """Return 'local' if the endpoint URL points to a private/local address, else 'api'.
     Includes the Tailscale CGNAT range (100.64.0.0/10) so tailnet-hosted
     servers (e.g. Cookbook serve endpoints) get reachability-probed too."""
+    from src.cursor_sdk.provider import is_cursor_sdk_base
+
+    if is_cursor_sdk_base(base_url):
+        return "local"
     kind = _normalize_endpoint_kind(endpoint_kind)
     if kind == "local":
         return "local"
@@ -765,6 +798,29 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
     from src.llm_core import httpx_get_kimi_aware
     base = resolve_url(_normalize_base(base_url))
     provider = _safe_detect_provider(base)
+    if provider == "cursor-sdk":
+        from src.cursor_sdk.auth import CursorSDKAuthError
+        from src.cursor_sdk.model_discovery import list_cursor_sdk_model_ids
+        from src.cursor_sdk.provider import CURSOR_SDK_MODELS
+
+        try:
+            import cursor_sdk  # noqa: F401
+        except ImportError:
+            logger.warning("cursor-sdk package not installed; using curated Cursor models")
+            return list(CURSOR_SDK_MODELS)
+        try:
+            probe_timeout = max(int(timeout or 5), 15)
+            return list_cursor_sdk_model_ids(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=probe_timeout,
+            )
+        except CursorSDKAuthError as exc:
+            logger.warning("Cursor SDK auth failed during model probe: %s", exc)
+            return []
+        except Exception as exc:
+            logger.warning("Cursor SDK model probe failed: %s", exc)
+            return []
     if provider == "chatgpt-subscription":
         from src.chatgpt_subscription import fetch_available_models
         if api_key:
@@ -863,6 +919,17 @@ def _ping_endpoint(base_url: str, api_key: str = None, timeout: float = 1.5) -> 
     from src.endpoint_resolver import resolve_url
     base = resolve_url(_normalize_base(base_url))
     headers = _safe_build_headers(api_key, base)
+    provider = _safe_detect_provider(base)
+    if provider == "cursor-sdk":
+        from src.cursor_sdk.auth import CursorSDKAuthError, resolve_api_key
+
+        try:
+            resolve_api_key(api_key)
+            return {"reachable": True, "status_code": 200, "error": None}
+        except CursorSDKAuthError as exc:
+            return {"reachable": False, "error": str(exc)[:120]}
+        except Exception as exc:
+            return {"reachable": False, "error": str(exc)[:80]}
 
     # Ollama exposes /v1/models (OpenAI-compatible) AND native /api/version,
     # /api/tags. Probe native paths for Ollama-style endpoints, but avoid using
@@ -1073,9 +1140,13 @@ def _visible_models(cached_models, hidden_models, pinned_models=None):
         _normalize_model_ids(pinned_models),
     )
     if not hidden_models:
-        return merged
-    hidden = set(_normalize_model_ids(hidden_models))
-    return [m for m in merged if m not in hidden]
+        visible = merged
+    else:
+        hidden = set(_normalize_model_ids(hidden_models))
+        visible = [m for m in merged if m not in hidden]
+    from src.cursor_sdk.provider import filter_cursor_sdk_model_ids
+
+    return filter_cursor_sdk_model_ids(visible)
 
 
 def _api_key_fingerprint(api_key: Optional[str]) -> str:
@@ -2216,6 +2287,9 @@ def setup_model_routes(model_discovery):
                         model = visible[0]
                 except Exception:
                     pass
+            from src.cursor_sdk.provider import is_cursor_sdk_base, normalize_cursor_sdk_model
+            if is_cursor_sdk_base(base):
+                model = normalize_cursor_sdk_model(model)
             return {"endpoint_id": ep.id, "endpoint_url": chat_url, "model": model}
         finally:
             db.close()

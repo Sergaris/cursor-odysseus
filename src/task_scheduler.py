@@ -1825,89 +1825,93 @@ class TaskScheduler:
         return full_text or "(no output)"
 
     async def _execute_research_task(self, task, db) -> str:
-        """Execute a deep research task using DeepResearcher."""
-        from core.database import Session as DbSession, ChatMessage
-        from src.deep_research import DeepResearcher
-        from src.research_handler import RESEARCH_DATA_DIR, ResearchHandler
+        """Execute a deep research task using ResearchHandler (HTTP or Cursor SDK)."""
+        from core.database import Session as DbSession
+        from src.research_handler import RESEARCH_DATA_DIR, ResearchHandler, _is_cursor_research_brain
         from src.research_utils import strip_thinking
         from src.settings import get_setting
 
-        # Resolve endpoint/model: research settings > task settings > session defaults
+        handler = ResearchHandler()
+        task_entry: dict = {}
+        session_id = task.session_id or str(uuid.uuid4())
         endpoint_url = task.endpoint_url
         model = task.model
-        headers = {}
-        headers_from_resolver = False
+        headers: dict = {}
 
-        if not endpoint_url or not model:
+        if _is_cursor_research_brain():
+            from src.cursor_sdk.provider import CURSOR_SDK_BASE_URL
+
+            endpoint_url = CURSOR_SDK_BASE_URL
+            model = (get_setting("research_brain_model", "composer-2.5") or "composer-2.5").strip()
+        else:
+            headers_from_resolver = False
+            if not endpoint_url or not model:
+                try:
+                    from src.endpoint_resolver import resolve_endpoint
+                    ep_url, ep_model, ep_headers = resolve_endpoint(
+                        "research",
+                        fallback_url=endpoint_url or None,
+                        fallback_model=model or None,
+                        owner=task.owner or None,
+                    )
+                    endpoint_url = ep_url or endpoint_url
+                    model = ep_model or model
+                    if ep_headers is not None:
+                        headers = ep_headers
+                        headers_from_resolver = True
+                except Exception:
+                    pass
+
+            if not endpoint_url or not model:
+                endpoint_url, model = self._resolve_defaults(db, task.owner)
+            if not endpoint_url or not model:
+                raise RuntimeError("No model/endpoint configured for research")
+            endpoint_url = _normalize_chat_endpoint(endpoint_url)
+
             try:
-                from src.endpoint_resolver import resolve_endpoint
-                ep_url, ep_model, ep_headers = resolve_endpoint(
-                    "research",
-                    endpoint_url or None,
-                    model or None,
-                    None,
-                    owner=task.owner or None,
-                )
-                endpoint_url = ep_url or endpoint_url
-                model = ep_model or model
-                if ep_headers is not None:
-                    headers = ep_headers
-                    headers_from_resolver = True
+                from core.database import ModelEndpoint
+                from src.endpoint_resolver import normalize_base, build_headers
+                from src.auth_helpers import owner_filter
+                if not headers_from_resolver:
+                    ep_q = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)
+                    ep_q = owner_filter(ep_q, ModelEndpoint, task.owner or None)
+                    for ep in ep_q.all():
+                        if normalize_base(ep.base_url) in endpoint_url or endpoint_url in normalize_base(ep.base_url):
+                            headers = build_headers(ep.api_key, normalize_base(ep.base_url))
+                            break
             except Exception:
                 pass
 
-        if not endpoint_url or not model:
-            endpoint_url, model = self._resolve_defaults(db, task.owner)
-        if not endpoint_url or not model:
-            raise RuntimeError("No model/endpoint configured for research")
-        endpoint_url = _normalize_chat_endpoint(endpoint_url)
-        # Record the resolved model for the run record (see _execute_task_locked).
         self._last_run_model = model
-
-        # Resolve headers
-        try:
-            from core.database import ModelEndpoint
-            from src.endpoint_resolver import normalize_base, build_headers
-            from src.auth_helpers import owner_filter
-            db2 = db
-            if not headers_from_resolver:
-                ep_q = db2.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)
-                ep_q = owner_filter(ep_q, ModelEndpoint, task.owner or None)
-                eps = ep_q.all()
-                for ep in eps:
-                    if normalize_base(ep.base_url) in endpoint_url or endpoint_url in normalize_base(ep.base_url):
-                        headers = build_headers(ep.api_key, normalize_base(ep.base_url))
-                        break
-        except Exception:
-            pass
-
-        max_tokens = int(get_setting("research_max_tokens", 8192))
         extraction_timeout = int(get_setting("research_extraction_timeout_seconds", 90) or 90)
         extraction_concurrency = int(get_setting("research_extraction_concurrency", 3) or 3)
 
-        researcher = DeepResearcher(
+        started_ts = time.time()
+        report = await handler.call_research_service(
+            query=task.prompt or task.name or "Scheduled research",
             llm_endpoint=endpoint_url,
             llm_model=model,
+            max_time=600,
             llm_headers=headers,
+            _task_entry=task_entry,
+            session_id=session_id,
             max_rounds=8,
-            max_time=600,  # 10 min for scheduled research
-            max_report_tokens=max_tokens,
             extraction_timeout=extraction_timeout,
             extraction_concurrency=extraction_concurrency,
+            category="scheduled",
         )
-
-        started_ts = time.time()
-        report = await researcher.research(task.prompt)
         completed_ts = time.time()
-        try:
-            stats = researcher.get_stats() or {}
-        except Exception:
-            stats = {}
 
-        # Ensure a session exists for output
-        session_id = task.session_id
-        if not session_id:
-            session_id = str(uuid.uuid4())
+        researcher = task_entry.get("researcher")
+        stats = task_entry.get("stats") or {}
+        if not stats and researcher is not None:
+            try:
+                stats = researcher.get_stats() or {}
+            except Exception:
+                stats = {}
+        findings = getattr(researcher, "findings", []) if researcher is not None else []
+
+        if not task.session_id:
             sess = DbSession(
                 id=session_id,
                 name=f"[Research] {task.name}",
@@ -1932,7 +1936,6 @@ class TaskScheduler:
         # no Library entry and no visual report route to open.
         try:
             RESEARCH_DATA_DIR.mkdir(parents=True, exist_ok=True)
-            findings = getattr(researcher, "findings", []) or []
             payload = {
                 "query": task.prompt or task.name or "Scheduled research",
                 "status": "done",

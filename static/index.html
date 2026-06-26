@@ -1495,17 +1495,63 @@
             <div class="admin-toggle-sub" style="margin-bottom:8px">Model used for Deep Research, more settings under <a href="#" data-go-settings-tab="search" style="color:var(--accent, var(--red));text-decoration:underline;font-weight:600;">Search →</a></div>
             <div class="settings-col">
               <div class="settings-row">
-                <label class="settings-label">Endpoint</label>
-                <select id="set-researchEndpoint" class="settings-select">
-                  <option value="">Same as chat</option>
+                <label class="settings-label">Brain provider</label>
+                <select id="set-researchBrainProvider" class="settings-select">
+                  <option value="http">HTTP endpoint</option>
+                  <option value="cursor_sdk">Cursor SDK</option>
                 </select>
               </div>
-              <div class="settings-row">
-                <label class="settings-label">Model</label>
-                <span class="adm-model-logo" id="set-researchModel-logo" style="display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;flex-shrink:0;opacity:0.9;color:var(--fg);"></span>
-                <select id="set-researchModel" class="settings-select">
-                  <option value="">Same as chat</option>
-                </select>
+              <div id="set-researchHttpBlock">
+                <div class="settings-row">
+                  <label class="settings-label">Endpoint</label>
+                  <select id="set-researchEndpoint" class="settings-select">
+                    <option value="">Same as chat</option>
+                  </select>
+                </div>
+                <div class="settings-row">
+                  <label class="settings-label">Model</label>
+                  <span class="adm-model-logo" id="set-researchModel-logo" style="display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;flex-shrink:0;opacity:0.9;color:var(--fg);"></span>
+                  <select id="set-researchModel" class="settings-select">
+                    <option value="">Same as chat</option>
+                  </select>
+                </div>
+              </div>
+              <div id="set-researchCursorBlock" style="display:none;">
+                <div class="admin-toggle-sub" style="margin-bottom:8px;color:color-mix(in srgb, var(--fg) 55%, transparent);">
+                  Cursor SDK: tools через fenced blocks Odysseus (```web_search```), не native function calling. Deep Research brain — text-only prompt.
+                </div>
+                <div class="settings-row">
+                  <label class="settings-label">Model</label>
+                  <select id="set-researchCursorModel" class="settings-select">
+                    <option value="composer-2.5">composer-2.5</option>
+                    <option value="auto">auto</option>
+                  </select>
+                </div>
+                <div class="settings-row">
+                  <label class="settings-label">Workspace</label>
+                  <input id="set-cursorWorkspace" type="text" placeholder="Absolute path (default: app root)" class="settings-select">
+                </div>
+                <div class="settings-row">
+                  <label class="settings-label">API key</label>
+                  <input id="set-cursorApiKey" type="password" placeholder="Optional — env or worker.env" class="settings-select" autocomplete="off">
+                </div>
+                <div class="settings-row">
+                  <label class="settings-label"></label>
+                  <button type="button" id="set-cursorProbeBtn" class="settings-select" style="width:auto;padding:6px 12px;cursor:pointer;">Test connection</button>
+                  <span id="set-cursorProbeMsg" style="font-size:11px;margin-left:8px;color:var(--fg);"></span>
+                </div>
+                <div class="settings-row" style="margin-top:6px;">
+                  <label class="settings-label">Extract endpoint</label>
+                  <select id="set-researchExtractEndpoint" class="settings-select">
+                    <option value="">Same as brain (Composer)</option>
+                  </select>
+                </div>
+                <div class="settings-row">
+                  <label class="settings-label">Extract model</label>
+                  <select id="set-researchExtractModel" class="settings-select">
+                    <option value="">Auto</option>
+                  </select>
+                </div>
               </div>
               <div id="set-researchMsg" style="font-size:11px;color:color-mix(in srgb, var(--fg) 45%, transparent);margin-top:2px;"></div>
             </div>
@@ -2192,6 +2238,7 @@
                   <option value="https://api.openai.com/v1" data-logo="openai">OpenAI</option>
                   <option value="copilot" data-logo="github" data-auth-flow="copilot">GitHub Copilot</option>
                   <option value="chatgpt-subscription" data-logo="openai" data-auth-flow="chatgpt-subscription">ChatGPT Subscription</option>
+                  <option value="cursor-sdk://local" data-logo="cursor" data-provider-kind="cursor-sdk">Cursor SDK</option>
                   <option value="https://openrouter.ai/api/v1" data-logo="openrouter">OpenRouter</option>
                   <option value="https://ollama.com/api" data-logo="ollama">Ollama Cloud</option>
                   <option value="https://api.groq.com/openai/v1" data-logo="groq">Groq</option>
@@ -2214,6 +2261,9 @@
                   <button class="admin-btn-add" id="adm-epAddBtn" style="height:32px;min-width:55px;text-align:center;display:inline-flex;align-items:center;justify-content:center;gap:4px;flex-shrink:0;box-sizing:border-box;">
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Add
                   </button>
+                </div>
+                <div class="admin-model-form-row" id="adm-cursorWorkspace-row" style="display:none;">
+                  <input id="adm-cursorWorkspace" type="text" placeholder="Workspace path (optional, default: app root)" autocomplete="off" style="flex:1;height:32px;box-sizing:border-box;">
                 </div>
                 <div id="adm-epApiMsg" class="adm-ep-inline-msg"></div>
                 <div id="adm-deviceAuthStatus" class="adm-ep-inline-msg" style="min-height:0;margin-top:0;"></div>

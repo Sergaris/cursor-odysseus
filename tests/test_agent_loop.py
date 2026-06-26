@@ -73,6 +73,13 @@ def test_polish_internet_search_request_classifies_as_web():
     assert "web" in intent["domains"]
 
 
+def test_russian_language_ui_request_is_not_low_signal():
+    intent = _classify_agent_request([], "я могу сменить язык на русский?")
+
+    assert intent["low_signal"] is False
+    assert "ui" in intent["domains"]
+
+
 # ---------------------------------------------------------------------------
 # _detect_admin_intent
 # ---------------------------------------------------------------------------

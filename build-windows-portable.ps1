@@ -48,8 +48,12 @@ Write-Host ("Using Python: " + $pyExe)
 
 Write-Step "Installing build dependencies"
 & $pyExe -m pip install --upgrade pip --quiet
-& $pyExe -m pip install -r requirements.txt pyinstaller pystray Pillow
+& $pyExe -m pip install -r requirements.txt -r requirements-optional.txt pyinstaller pystray Pillow pywebview
 if ($LASTEXITCODE -ne 0) { Fail "Dependency install failed." }
+
+Write-Step "Checking Cursor SDK bridge"
+& $pyExe -c "from cursor_sdk._vendor import resolve_bridge_path; print('bridge:', resolve_bridge_path())"
+if ($LASTEXITCODE -ne 0) { Fail "cursor-sdk bridge not available. Install cursor-sdk before building portable exe." }
 
 Write-Step "Building portable exe bundle"
 Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
@@ -63,7 +67,21 @@ $dataArgs = @(
     "--add-data", ".env.example;.env.example"
 )
 
-& $pyExe -m PyInstaller --noconfirm --clean --onedir --noconsole --icon=static/icon.ico --name Odysseus @dataArgs launcher.py
+$pyInstallerArgs = @(
+    "--noconfirm", "--clean", "--onedir", "--noconsole",
+    "--icon=static/icon.ico", "--name", "Odysseus",
+    "--hidden-import=desktop_shell",
+    "--hidden-import=src.desktop_shutdown",
+    "--hidden-import=src.frozen_runtime",
+    "--hidden-import=src.desktop_single_instance",
+    "--hidden-import=src.subprocess_entry",
+    "--hidden-import=webview",
+    "--hidden-import=webview.platforms.edgechromium",
+    "--collect-all", "cursor_sdk",
+    "--collect-all", "webview"
+) + $dataArgs + @("launcher.py")
+
+& $pyExe -m PyInstaller @pyInstallerArgs
 if ($LASTEXITCODE -ne 0) { Fail "PyInstaller build failed." }
 
 Write-Host ""

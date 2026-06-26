@@ -96,7 +96,7 @@ async def register_builtin_servers(mcp_manager):
         return
 
     base_dir = get_app_root()
-    python = sys.executable
+    python = sys.executable  # frozen: Odysseus.exe runs script via launcher worker mode
 
     async def _connect_python_server(server_id: str, script_path: str, name: str):
         try:

@@ -41,6 +41,12 @@ def _format_probe_failure(model: str, exc: Exception) -> str:
     if status in {401, 403} or "401" in err or "API key" in err or "Unauthorized" in err:
         return f"Model '{model}' requires an API key. Check your endpoint configuration."
 
+    if isinstance(exc, TimeoutError) or type(exc).__name__ == "TimeoutError":
+        return (
+            f"Model '{model}' probe timed out — the model may be slow to respond. "
+            "Try again or pick a specific model."
+        )
+
     if status and err:
         return f"Model '{model}' probe failed: {err}"
 
@@ -48,6 +54,74 @@ def _format_probe_failure(model: str, exc: Exception) -> str:
         return f"Cannot reach model '{model}' — {err}"
 
     return f"Cannot reach model '{model}' — check that the endpoint is running and accessible."
+
+
+def _is_cursor_research_brain() -> bool:
+    from src.settings import get_setting
+    return get_setting("research_brain_provider", "http") == "cursor_sdk"
+
+
+def _cursor_research_workspace() -> str:
+    from src.cursor_sdk.provider import resolve_cursor_sdk_cwd
+    return resolve_cursor_sdk_cwd()
+
+
+def _cursor_research_model() -> str:
+    from src.settings import get_setting
+    return (get_setting("research_brain_model", "composer-2.5") or "composer-2.5").strip()
+
+
+def _build_cursor_research_backend(session_id: str = ""):
+    """Создаёт Cursor SDK backend для Deep Research."""
+    from src.cursor_sdk.auth import resolve_api_key
+    from src.cursor_sdk.async_session_registry import AsyncSessionRegistry
+    from src.cursor_sdk.backend import CursorSDKBackend
+    from src.settings import get_setting
+
+    api_key = resolve_api_key((get_setting("cursor_api_key", "") or "").strip() or None)
+    model = _cursor_research_model()
+    cwd = _cursor_research_workspace()
+    registry = AsyncSessionRegistry(api_key=api_key, model=model, cwd=cwd)
+    backend = CursorSDKBackend(
+        model=model,
+        cwd=cwd,
+        api_key=api_key,
+        registry=registry,
+        scope="research",
+        scope_id=session_id or "research",
+    )
+    return backend, registry
+
+
+def _build_cursor_ephemeral_backend():
+    """One-shot Cursor SDK backend для synthesize/plan."""
+    from src.cursor_sdk.backend import CursorSDKBackend
+    from src.settings import get_setting
+
+    return CursorSDKBackend(
+        model=_cursor_research_model(),
+        cwd=_cursor_research_workspace(),
+        api_key=(get_setting("cursor_api_key", "") or "").strip() or None,
+        scope="ephemeral",
+    )
+
+
+def _resolve_research_extract_llm(owner: str | None = None) -> tuple[str | None, str | None, dict | None]:
+    """HTTP endpoint/model для per-URL extract в hybrid cursor mode."""
+    from src.endpoint_resolver import resolve_endpoint
+    from src.settings import get_setting
+
+    if not (get_setting("research_extract_endpoint_id", "") or "").strip():
+        return None, None, None
+
+    try:
+        url, model, headers = resolve_endpoint("research_extract", owner=owner)
+    except Exception:
+        return None, None, None
+
+    if not url or not model:
+        return None, None, None
+    return url, model, headers or {}
 
 
 def _research_json_path(session_id: str) -> Optional[Path]:
@@ -145,23 +219,33 @@ class ResearchHandler:
         convo += f"\nUser: {latest_message}"
 
         try:
-            from src.llm_core import llm_call_async
+            synth_messages = [{"role": "user", "content":
+                "Read this conversation and write a single, specific research query that captures "
+                "what the user wants to know. Include all relevant context, constraints, and preferences "
+                "they mentioned. Output ONLY the research query — nothing else.\n\n"
+                f"Conversation:\n{convo}"
+            }]
+            if _is_cursor_research_brain():
+                backend = _build_cursor_ephemeral_backend()
+                response = await backend.complete(
+                    synth_messages,
+                    temperature=0.1,
+                    max_tokens=200,
+                    timeout=15,
+                )
+            else:
+                from src.llm_core import llm_call_async
 
-            response = await llm_call_async(
-                url=llm_endpoint,
-                model=llm_model,
-                messages=[{"role": "user", "content":
-                    "Read this conversation and write a single, specific research query that captures "
-                    "what the user wants to know. Include all relevant context, constraints, and preferences "
-                    "they mentioned. Output ONLY the research query — nothing else.\n\n"
-                    f"Conversation:\n{convo}"
-                }],
-                temperature=0.1,
-                max_tokens=200,
-                headers=llm_headers,
-                timeout=15,
-                max_retries=1,
-            )
+                response = await llm_call_async(
+                    url=llm_endpoint,
+                    model=llm_model,
+                    messages=synth_messages,
+                    temperature=0.1,
+                    max_tokens=200,
+                    headers=llm_headers,
+                    timeout=15,
+                    max_retries=1,
+                )
             query = strip_thinking(response).strip().strip('"\'')
             if query and len(query) > 5:
                 return query
@@ -176,19 +260,30 @@ class ResearchHandler:
         """Generate a research plan for user review before starting research."""
         try:
             from src.deep_research import RESEARCH_PLAN_PROMPT, current_date_context
-            from src.llm_core import llm_call_async
 
             prompt = current_date_context() + RESEARCH_PLAN_PROMPT.format(question=query)
-            response = await llm_call_async(
-                url=llm_endpoint,
-                model=llm_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=1024,
-                headers=llm_headers,
-                timeout=30,
-                max_retries=1,
-            )
+            plan_messages = [{"role": "user", "content": prompt}]
+            if _is_cursor_research_brain():
+                backend = _build_cursor_ephemeral_backend()
+                response = await backend.complete(
+                    plan_messages,
+                    temperature=0.3,
+                    max_tokens=1024,
+                    timeout=30,
+                )
+            else:
+                from src.llm_core import llm_call_async
+
+                response = await llm_call_async(
+                    url=llm_endpoint,
+                    model=llm_model,
+                    messages=plan_messages,
+                    temperature=0.3,
+                    max_tokens=1024,
+                    headers=llm_headers,
+                    timeout=30,
+                    max_retries=1,
+                )
             response = strip_thinking(response)
 
             # Try to parse structured plan
@@ -339,6 +434,7 @@ class ResearchHandler:
                         category=category,
                         extraction_timeout=extraction_timeout,
                         extraction_concurrency=extraction_concurrency,
+                        session_id=session_id,
                     ),
                     timeout=hard_timeout,
                 )
@@ -454,6 +550,14 @@ class ResearchHandler:
         researcher = entry.get("researcher")
         if researcher:
             researcher.cancel()
+        cursor_backend = entry.get("cursor_backend")
+        if cursor_backend:
+            try:
+                cursor_backend.close(cancel_run=True)
+            except Exception as exc:
+                logger.warning("Cursor SDK backend close on cancel failed: %s", exc)
+            entry["cursor_backend"] = None
+            entry["cursor_registry"] = None
         task = entry.get("task")
         if task and not task.done():
             task.cancel()
@@ -754,6 +858,7 @@ class ResearchHandler:
         category: str = None,
         extraction_timeout: int = None,
         extraction_concurrency: int = None,
+        session_id: str = "",
     ) -> str:
         """
         Run iterative deep research using the LLM-in-the-loop DeepResearcher.
@@ -779,10 +884,38 @@ class ResearchHandler:
         if is_continuation:
             logger.info(f"Prior: {len(prior_findings or [])} findings, {len(prior_urls or set())} URLs")
 
+        cursor_backend = None
+        cursor_registry = None
+        use_cursor = _is_cursor_research_brain()
+        if use_cursor:
+            from src.cursor_sdk.provider import CURSOR_SDK_BASE_URL
+
+            llm_endpoint = CURSOR_SDK_BASE_URL
+            llm_model = _cursor_research_model()
+            llm_headers = {}
+            try:
+                cursor_backend, cursor_registry = _build_cursor_research_backend(session_id)
+                if _task_entry is not None:
+                    _task_entry["cursor_backend"] = cursor_backend
+                    _task_entry["cursor_registry"] = cursor_registry
+            except Exception as e:
+                logger.error("Cursor SDK backend init failed: %s", e)
+                raise RuntimeError(_format_probe_failure(llm_model, e)) from e
+
         # Probe the endpoint before committing to a long research run
         if progress_callback:
             progress_callback({"phase": "probing", "model": llm_model})
-        await self._probe_endpoint(llm_endpoint, llm_model, llm_headers)
+        if use_cursor and cursor_backend is not None:
+            try:
+                await cursor_backend.probe(timeout=15)
+                logger.info("Cursor SDK probe OK: %s", llm_model)
+            except Exception as e:
+                logger.error("Cursor SDK probe failed for %s: %s", llm_model, e)
+                if cursor_backend is not None:
+                    cursor_backend.close()
+                raise RuntimeError(_format_probe_failure(llm_model, e)) from e
+        else:
+            await self._probe_endpoint(llm_endpoint, llm_model, llm_headers)
 
         try:
             from src.deep_research import DeepResearcher
@@ -814,6 +947,16 @@ class ResearchHandler:
                 maximum=3600,
             )
 
+            extract_url, extract_model, extract_headers = (None, None, None)
+            if use_cursor:
+                extract_url, extract_model, extract_headers = _resolve_research_extract_llm()
+                if extract_url and extract_model:
+                    logger.info(
+                        "Hybrid research extract: %s / %s",
+                        extract_url,
+                        extract_model,
+                    )
+
             researcher = DeepResearcher(
                 llm_endpoint=llm_endpoint,
                 llm_model=llm_model,
@@ -829,6 +972,10 @@ class ResearchHandler:
                 progress_callback=progress_callback,
                 search_provider=search_provider,
                 category=category,
+                cursor_backend=cursor_backend,
+                extract_llm_endpoint=extract_url,
+                extract_llm_model=extract_model,
+                extract_llm_headers=extract_headers,
             )
             if _task_entry is not None:
                 _task_entry["researcher"] = researcher
@@ -857,6 +1004,9 @@ class ResearchHandler:
         except Exception as e:
             logger.error(f"DeepResearcher failed: {e}", exc_info=True)
             return await self._fallback_research(query, llm_endpoint, llm_model, max_time, str(e))
+        finally:
+            if cursor_backend is not None:
+                cursor_backend.close()
 
     async def _fallback_research(
         self, query: str, llm_endpoint: str, llm_model: str,

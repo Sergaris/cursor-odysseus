@@ -456,8 +456,9 @@ class ToolIndex:
         # Theme / UI control intent
         frozenset({"theme", "color scheme", "colors of the ui", "make it dark",
                    "make it light", "make the ui", "switch theme", "change theme",
-                   "dark mode", "light mode", "toggle"}):
-            {"ui_control"},
+                   "dark mode", "light mode", "toggle", "language", "locale",
+                   "русский", "язык", "настройки", "интерфейс", "локал"}):
+            {"ui_control", "manage_settings"},
         # Cookbook / model serving intent — user says "kill cookbook",
         # "stop the model", "what's running", etc.
         frozenset({"cookbook", "kill cookbook", "stop cookbook",

@@ -56,6 +56,12 @@ def test_explicit_web_search_promotes_to_agent():
     assert classify_tool_intent("use web search and find a recipe").category == "web"
 
 
+def test_weather_lookup_promotes_to_agent():
+    assert message_needs_tools("What's the weather tomorrow in Moscow?")
+    assert message_needs_tools("какая погода завтра в мск?")
+    assert classify_tool_intent("какая погода завтра в мск?").category == "web"
+
+
 def test_explanatory_calendar_questions_stay_plain_chat():
     assert not message_needs_tools("How do I add an entry to my calendar?")
     assert not message_needs_tools("What about the built-in Odysseus calendar, is that linked to email?")

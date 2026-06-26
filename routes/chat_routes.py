@@ -624,6 +624,17 @@ def setup_chat_routes(
         except (ValueError, ValidationError):
             raise HTTPException(400, "Invalid request parameters")
 
+        try:
+            from src.cursor_sdk.provider import is_cursor_sdk_base
+            if is_cursor_sdk_base(getattr(sess, "endpoint_url", "") or "") and chat_mode == "chat":
+                chat_mode = "agent"
+                auto_escalated = True
+                logger.info(
+                    "chat→agent: Cursor SDK endpoint requires agent loop for Odysseus tools"
+                )
+        except Exception:
+            pass
+
         # ------------------------------------------------------------------ #
         # Privilege gates that must fire BEFORE any LLM work / token spend.
         #   1. allowed_models — reject if session.model isn't in the user's

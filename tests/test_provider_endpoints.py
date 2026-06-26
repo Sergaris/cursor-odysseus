@@ -176,6 +176,16 @@ def test_first_chat_model_empty(models):
     assert er._first_chat_model(models) is None
 
 
+def test_first_chat_model_cursor_sdk_prefers_default():
+    models = ["composer-2.5", "default", "gpt-5.5"]
+    assert er._first_chat_model(models, "cursor-sdk://local") == "default"
+
+
+def test_first_chat_model_cursor_sdk_without_default_uses_first_chat():
+    models = ["composer-2.5-fast", "composer-2.5", "gpt-5.5"]
+    assert er._first_chat_model(models, "cursor-sdk://local") == "composer-2.5"
+
+
 # ── provider-root helpers ──
 
 @pytest.mark.parametrize("base,expected", [

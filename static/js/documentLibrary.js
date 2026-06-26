@@ -12,6 +12,7 @@ import markdownModule from './markdown.js';
 import { makeWindowDraggable } from './windowDrag.js';
 import { langIcon } from './langIcons.js';
 import { registerMenuDismiss, dismissOrRemove } from './escMenuStack.js';
+import { openResearchReport } from './researchReport.js';
 
 // ── Injected references from documentModule ──
 let API_BASE = '';
@@ -2556,7 +2557,7 @@ let _libraryArchivedView = false;   // Documents tab showing archived docs?
           _toggleResearchPreview(card, r);
         });
         card.querySelector('._arc-res-menu').addEventListener('click', (e) => { e.stopPropagation(); _showLibDropdown(e.currentTarget, [
-          { label: 'Open', action: () => { const a = document.createElement('a'); a.href = '/api/research/report/' + r.id; a.target = '_blank'; a.rel = 'noopener'; document.body.appendChild(a); a.click(); a.remove(); } },
+          { label: 'Open', action: () => openResearchReport(r.id) },
           { label: 'Restore', action: async () => { await fetch('/api/research/' + r.id + '/archive?archived=false', { method: 'POST', credentials: 'same-origin' }); _renderLibArchive(); } },
           { label: 'Delete', danger: true, action: async () => { if (!await window.styledConfirm('Delete this research?', { confirmText: 'Delete', danger: true })) return; await fetch('/api/research/' + r.id, { method: 'DELETE', credentials: 'same-origin' }); _renderLibArchive(); } },
         ], { onSelect: () => {
@@ -2798,13 +2799,7 @@ let _libraryArchivedView = false;   // Documents tab showing archived docs?
       const openBtn = preview.querySelector('.doclib-chat-open-btn');
       if (openBtn) openBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        const a = document.createElement('a');
-        a.href = '/api/research/report/' + item.id;
-        a.target = '_blank';
-        a.rel = 'noopener';
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
+        openResearchReport(item.id);
       });
       const delBtn = preview.querySelector('.doclib-chat-delete-btn');
       if (delBtn) delBtn.addEventListener('click', async (e) => {
@@ -2944,15 +2939,7 @@ let _libraryArchivedView = false;   // Documents tab showing archived docs?
           e.stopPropagation();
           const rid = btn.dataset.rid;
           _showLibDropdown(btn, [
-            { label: 'Open', action: () => {
-                const a = document.createElement('a');
-                a.href = '/api/research/report/' + rid;
-                a.target = '_blank';
-                a.rel = 'noopener';
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-              } },
+            { label: 'Open', action: () => openResearchReport(rid) },
             { label: _researchArchivedView ? 'Restore' : 'Archive', action: async () => {
                 const toArchived = !_researchArchivedView;
                 const card = btn.closest('.doclib-research-card');

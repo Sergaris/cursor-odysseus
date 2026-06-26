@@ -6,6 +6,7 @@ import themeModule from '../theme.js';
 import createResearchSynapse from '../researchSynapse.js';
 import spinnerModule from '../spinner.js';
 import { sortModelIds } from '../modelSort.js';
+import { openResearchReport } from '../researchReport.js';
 
 // Rotating research textarea placeholders — pick one at random each
 // time the panel is rendered so the example keeps feeling fresh.
@@ -1013,7 +1014,7 @@ function _buildJobCard(job) {
     // stopPropagation) opens the visual report — same as the Visual Report btn.
     card.style.cursor = 'pointer';
     card.addEventListener('click', () => {
-      window.open(`${_apiBase}/api/research/report/${job.id}`, '_blank');
+      openResearchReport(job.id);
     });
     card.querySelector('[data-action="copy"]').addEventListener('click', async (e) => {
       e.stopPropagation();
@@ -1023,7 +1024,7 @@ function _buildJobCard(job) {
     });
     card.querySelector('[data-action="report"]').addEventListener('click', (e) => {
       e.stopPropagation();
-      window.open(`${_apiBase}/api/research/report/${job.id}`, '_blank');
+      openResearchReport(job.id);
     });
     card.querySelector('[data-action="chat"]').addEventListener('click', (e) => {
       e.stopPropagation();

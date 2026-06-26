@@ -674,6 +674,9 @@ def _detect_provider(url: str) -> str:
     from src.chatgpt_subscription import is_chatgpt_subscription_base
     if is_chatgpt_subscription_base(url):
         return "chatgpt-subscription"
+    from src.cursor_sdk.provider import is_cursor_sdk_base
+    if is_cursor_sdk_base(url):
+        return "cursor-sdk"
     from src.copilot import is_copilot_base
     if is_copilot_base(url):
         return "copilot"
@@ -761,6 +764,8 @@ def _provider_label(url: str) -> str:
     if _host_match(url, "groq.com"): return "Groq"
     from src.chatgpt_subscription import is_chatgpt_subscription_base
     if is_chatgpt_subscription_base(url): return "ChatGPT Subscription"
+    from src.cursor_sdk.provider import is_cursor_sdk_base
+    if is_cursor_sdk_base(url): return "Cursor SDK"
     from src.copilot import is_copilot_base
     if is_copilot_base(url): return "GitHub Copilot"
     if _host_match(url, "mistral.ai"): return "Mistral"
@@ -1676,10 +1681,36 @@ async def llm_call_async(
         messages_copy = non_sys
 
     cache_key = _get_cache_key(url, model, messages_copy, temperature, max_tokens)
-    cached_response = _get_cached_response(cache_key)
-    if cached_response:
-        logger.debug(f"Returning cached response for key: {cache_key}")
-        return cached_response
+    if provider != "cursor-sdk":
+        cached_response = _get_cached_response(cache_key)
+        if cached_response:
+            logger.debug(f"Returning cached response for key: {cache_key}")
+            return cached_response
+
+    if provider == "cursor-sdk":
+        from src.cursor_sdk.auth import extract_api_key_from_headers
+        from src.cursor_sdk.backend import CursorSDKBackend, CursorSDKError, CursorSDKRunError
+        from src.cursor_sdk.provider import resolve_cursor_sdk_cwd
+
+        endpoint_key = extract_api_key_from_headers(headers)
+
+        backend = CursorSDKBackend(
+            model=model,
+            cwd=resolve_cursor_sdk_cwd(url),
+            api_key=endpoint_key,
+            scope="ephemeral",
+        )
+        try:
+            return await backend.complete(
+                messages_copy,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+            )
+        except CursorSDKRunError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        except CursorSDKError as exc:
+            raise HTTPException(503, str(exc)) from exc
 
     if provider == "chatgpt-subscription":
         # ChatGPT/Codex requires streamed Responses requests even for callers
@@ -1816,7 +1847,8 @@ async def llm_call_async(
 async def stream_llm(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
-                     tools: Optional[List[Dict]] = None, session_id: Optional[str] = None):
+                     tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
+                     cursor_sdk_runtime=None):
     """Stream LLM responses with improved error handling.
 
     Yields SSE chunks:
@@ -1841,6 +1873,22 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         messages_copy = [{"role": "system", "content": "\n\n".join(sys_parts)}] + non_sys
     else:
         messages_copy = non_sys
+
+    if provider == "cursor-sdk":
+        from src.cursor_sdk.provider import resolve_cursor_sdk_cwd
+        from src.cursor_sdk.stream_bridge import stream_cursor_sdk
+
+        async for chunk in stream_cursor_sdk(
+            messages=messages_copy,
+            model=model,
+            cwd=resolve_cursor_sdk_cwd(url),
+            headers=headers,
+            session_id=session_id,
+            timeout=timeout,
+            tool_runtime=cursor_sdk_runtime,
+        ):
+            yield chunk
+        return
 
     if provider == "anthropic":
         target_url = _normalize_anthropic_url(url)

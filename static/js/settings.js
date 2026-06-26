@@ -1508,6 +1508,16 @@ var _SEARCH_PROVIDER_LOGOS = {
 async function initResearchSettings() {
   var epSel = el('set-researchEndpoint');
   var modelSel = el('set-researchModel');
+  var brainProviderSel = el('set-researchBrainProvider');
+  var httpBlock = el('set-researchHttpBlock');
+  var cursorBlock = el('set-researchCursorBlock');
+  var cursorModelSel = el('set-researchCursorModel');
+  var cursorWorkspaceInput = el('set-cursorWorkspace');
+  var cursorApiKeyInput = el('set-cursorApiKey');
+  var cursorProbeBtn = el('set-cursorProbeBtn');
+  var cursorProbeMsg = el('set-cursorProbeMsg');
+  var extractEpSel = el('set-researchExtractEndpoint');
+  var extractModelSel = el('set-researchExtractModel');
   var tokensInput = el('set-researchMaxTokens');
   var extractTimeoutInput = el('set-researchExtractTimeout');
   var extractConcurrencyInput = el('set-researchExtractConcurrency');
@@ -1515,9 +1525,40 @@ async function initResearchSettings() {
   var msg = el('set-researchMsg');
   var endpoints = [];
 
+  function isCursorMode() {
+    return brainProviderSel && brainProviderSel.value === 'cursor_sdk';
+  }
+
+  function toggleBrainBlocks() {
+    var cursor = isCursorMode();
+    if (httpBlock) httpBlock.style.display = cursor ? 'none' : '';
+    if (cursorBlock) cursorBlock.style.display = cursor ? '' : 'none';
+  }
+
+  async function loadCursorModels() {
+    if (!cursorModelSel) return;
+    try {
+      var res = await fetch('/api/cursor-sdk/models', { credentials: 'same-origin' });
+      if (!res.ok) return;
+      var data = await res.json();
+      var models = data.models || [];
+      if (!models.length) return;
+      var current = cursorModelSel.value;
+      cursorModelSel.innerHTML = '';
+      models.forEach(function(m) {
+        var opt = document.createElement('option');
+        opt.value = m;
+        opt.textContent = m;
+        cursorModelSel.appendChild(opt);
+      });
+      if (current && models.indexOf(current) >= 0) cursorModelSel.value = current;
+    } catch (e) { console.warn('Failed to load Cursor SDK models', e); }
+  }
+
   try {
     endpoints = await _fetchModelEndpoints();
     _fillEndpointSelect(epSel, endpoints, epSel.value, true);
+    if (extractEpSel) _fillEndpointSelect(extractEpSel, endpoints, extractEpSel.value, true);
   } catch (e) { console.warn('Failed to load endpoints for research', e); }
 
   function refreshModels(selectedModel) {
@@ -1526,22 +1567,51 @@ async function initResearchSettings() {
     _fillModelSelect(modelSel, ep ? ep.models : [], selectedModel, true);
   }
 
+  function refreshExtractModels(selectedModel) {
+    if (!extractEpSel || !extractModelSel) return;
+    var epId = extractEpSel.value;
+    var ep = endpoints.find(function(e) { return e.id === epId; });
+    _fillModelSelect(extractModelSel, ep ? ep.models : [], selectedModel, true);
+  }
+
   try {
     var res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
     var settings = await res.json();
+    if (settings.research_brain_provider) brainProviderSel.value = settings.research_brain_provider;
+    toggleBrainBlocks();
     if (settings.research_endpoint_id) epSel.value = settings.research_endpoint_id;
     refreshModels(settings.research_model || '');
+    if (settings.research_extract_endpoint_id && extractEpSel) {
+      extractEpSel.value = settings.research_extract_endpoint_id;
+    }
+    refreshExtractModels(settings.research_extract_model || '');
+    if (settings.research_brain_model && cursorModelSel) cursorModelSel.value = settings.research_brain_model;
+    if (settings.cursor_workspace && cursorWorkspaceInput) cursorWorkspaceInput.value = settings.cursor_workspace;
     if (settings.research_max_tokens) tokensInput.value = settings.research_max_tokens;
     if (settings.research_extraction_timeout_seconds) extractTimeoutInput.value = settings.research_extraction_timeout_seconds;
     if (settings.research_extraction_concurrency) extractConcurrencyInput.value = settings.research_extraction_concurrency;
     if (settings.research_run_timeout_seconds !== undefined && settings.research_run_timeout_seconds !== null) {
       runTimeoutInput.value = settings.research_run_timeout_seconds;
     }
+    if (isCursorMode()) loadCursorModels();
   } catch (e) { console.warn('Failed to load research settings', e); }
 
   function showStatus() {
     var parts = [];
-    if (epSel.value) {
+    if (isCursorMode()) {
+      parts.push('Cursor SDK');
+      if (cursorModelSel && cursorModelSel.value) parts.push(cursorModelSel.value);
+      if (cursorWorkspaceInput && cursorWorkspaceInput.value.trim()) {
+        parts.push('workspace: ' + cursorWorkspaceInput.value.trim());
+      }
+      if (extractEpSel && extractEpSel.value) {
+        var extractEpName = extractEpSel.options[extractEpSel.selectedIndex].textContent;
+        var extractModel = extractModelSel && extractModelSel.value
+          ? extractModelSel.value.split('/').pop()
+          : 'auto';
+        parts.push('hybrid extract: ' + extractEpName + ' / ' + extractModel);
+      }
+    } else if (epSel.value) {
       var epName = epSel.options[epSel.selectedIndex].textContent;
       var mName = modelSel.value ? modelSel.value.split('/').pop() : 'auto';
       parts.push(epName + ' / ' + mName);
@@ -1573,9 +1643,27 @@ async function initResearchSettings() {
 
   async function saveResearch() {
     var payload = {
-      research_endpoint_id: epSel.value,
-      research_model: modelSel.value,
+      research_brain_provider: brainProviderSel ? brainProviderSel.value : 'http',
     };
+    if (isCursorMode()) {
+      payload.research_brain_model = cursorModelSel ? cursorModelSel.value : 'composer-2.5';
+      payload.cursor_workspace = cursorWorkspaceInput ? cursorWorkspaceInput.value.trim() : '';
+      if (cursorApiKeyInput && cursorApiKeyInput.value.trim()) {
+        payload.cursor_api_key = cursorApiKeyInput.value.trim();
+      }
+      if (extractEpSel && extractEpSel.value) {
+        payload.research_extract_endpoint_id = extractEpSel.value;
+        if (extractModelSel && extractModelSel.value) {
+          payload.research_extract_model = extractModelSel.value;
+        }
+      } else {
+        payload.research_extract_endpoint_id = '';
+        payload.research_extract_model = '';
+      }
+    } else {
+      payload.research_endpoint_id = epSel.value;
+      payload.research_model = modelSel.value;
+    }
     var tv = parseInt(tokensInput.value, 10);
     if (tv && tv >= 1024) payload.research_max_tokens = tv;
     var et = parseInt(extractTimeoutInput.value, 10);
@@ -1584,7 +1672,6 @@ async function initResearchSettings() {
     if (ec && ec >= 1 && ec <= 12) payload.research_extraction_concurrency = ec;
     if (runTimeoutInput.value !== '') {
       var rt = parseInt(runTimeoutInput.value, 10);
-      // 0 = no limit (disables the hard timeout); otherwise 60s..86400s (24h)
       if (!isNaN(rt) && (rt === 0 || (rt >= 60 && rt <= 86400))) {
         payload.research_run_timeout_seconds = rt;
       }
@@ -1599,11 +1686,66 @@ async function initResearchSettings() {
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
   }
 
+  if (brainProviderSel) {
+    brainProviderSel.addEventListener('change', async function() {
+      toggleBrainBlocks();
+      if (isCursorMode()) await loadCursorModels();
+      saveResearch();
+    });
+  }
+  if (cursorProbeBtn) {
+    cursorProbeBtn.addEventListener('click', async function() {
+      cursorProbeMsg.textContent = 'Testing…';
+      cursorProbeMsg.style.color = 'var(--fg)';
+      cursorProbeBtn.disabled = true;
+      try {
+        var probePayload = {
+          model: cursorModelSel ? cursorModelSel.value : 'composer-2.5',
+          workspace: cursorWorkspaceInput ? cursorWorkspaceInput.value.trim() : '',
+        };
+        if (cursorApiKeyInput && cursorApiKeyInput.value.trim()) {
+          probePayload.api_key = cursorApiKeyInput.value.trim();
+        }
+        var probeRes = await fetch('/api/cursor-sdk/probe', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(probePayload),
+        });
+        var probeData = {};
+        try { probeData = await probeRes.json(); } catch (_) {}
+        if (!probeRes.ok) {
+          var errText = probeData.detail || probeData.message || ('HTTP ' + probeRes.status);
+          cursorProbeMsg.textContent = errText;
+          cursorProbeMsg.style.color = 'var(--red)';
+          return;
+        }
+        cursorProbeMsg.textContent = 'Connected';
+        cursorProbeMsg.style.color = 'var(--fg)';
+        saveResearch();
+      } catch (e) {
+        cursorProbeMsg.textContent = 'Probe failed';
+        cursorProbeMsg.style.color = 'var(--red)';
+      } finally {
+        cursorProbeBtn.disabled = false;
+      }
+    });
+  }
+
   epSel.addEventListener('change', async function() {
     refreshModels('');
     saveResearch();
   });
   modelSel.addEventListener('change', saveResearch);
+  if (cursorModelSel) cursorModelSel.addEventListener('change', saveResearch);
+  if (cursorWorkspaceInput) cursorWorkspaceInput.addEventListener('change', saveResearch);
+  if (extractEpSel) {
+    extractEpSel.addEventListener('change', function() {
+      refreshExtractModels('');
+      saveResearch();
+    });
+  }
+  if (extractModelSel) extractModelSel.addEventListener('change', saveResearch);
   tokensInput.addEventListener('change', saveResearch);
   extractTimeoutInput.addEventListener('change', saveResearch);
   extractConcurrencyInput.addEventListener('change', saveResearch);
@@ -1613,6 +1755,10 @@ async function initResearchSettings() {
     endpoints = nextEndpoints;
     _fillEndpointSelect(epSel, endpoints, epSel.value, true);
     refreshModels(modelSel.value);
+    if (extractEpSel) {
+      _fillEndpointSelect(extractEpSel, endpoints, extractEpSel.value, true);
+      refreshExtractModels(extractModelSel ? extractModelSel.value : '');
+    }
   });
 }
 

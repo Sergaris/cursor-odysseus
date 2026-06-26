@@ -2,7 +2,7 @@ import os
 import sys
 from unittest import mock
 import pytest
-from src.runtime_paths import get_app_root, get_default_data_dir
+from src.runtime_paths import get_app_root, get_default_data_dir, get_default_workspace_dir
 
 
 def test_get_app_root_normal_run():
@@ -47,4 +47,11 @@ def test_get_default_data_dir_frozen():
     with mock.patch.object(sys, "frozen", True, create=True):
         res = get_default_data_dir()
         expected = os.path.join(os.path.expanduser("~"), ".odysseus", "data")
+        assert res == expected
+
+
+def test_get_default_workspace_dir_frozen():
+    with mock.patch.object(sys, "frozen", True, create=True):
+        res = get_default_workspace_dir()
+        expected = os.path.join(os.path.expanduser("~"), ".odysseus", "workspace")
         assert res == expected

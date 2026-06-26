@@ -15,7 +15,8 @@
 #>
 param(
     [int]$Port = 7000,
-    [string]$BindHost = "127.0.0.1"
+    [string]$BindHost = "127.0.0.1",
+    [switch]$BootstrapOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -163,6 +164,11 @@ if (Test-Path $cudaBase) {
 }
 
 # 7. Start the server (use `python -m uvicorn` - bare `uvicorn` may not be on PATH)
+if ($BootstrapOnly) {
+    Write-Host "Bootstrap complete (venv, deps, setup)." -ForegroundColor Green
+    exit 0
+}
+
 Write-Step ("Starting Odysseus at http://{0}:{1}" -f $BindHost, $Port)
 Write-Host "Press Ctrl+C to stop."
 Write-Host ""

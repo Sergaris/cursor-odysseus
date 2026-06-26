@@ -508,7 +508,7 @@ async function loadEndpoints() {
       const statusBadge = ep.status === 'empty'
         ? '<span class="admin-badge">no models</span>'
         : ep.online
-          ? `<span class="admin-badge">${visibleCount}/${totalCount} models enabled</span>`
+          ? `<span class="admin-badge" data-adm-models-badge>${visibleCount}/${totalCount} models enabled</span>`
           : '<span class="admin-badge admin-badge-off">offline</span>';
       const justAddedClass = (_recentlyAddedEpId && String(ep.id) === _recentlyAddedEpId) ? ' adm-ep-just-added' : '';
       const category = ep.category || (_isLocalEndpoint(ep.base_url) ? 'local' : 'api');
@@ -732,6 +732,7 @@ async function loadEndpoints() {
             panel.querySelectorAll('input[type=checkbox]').forEach(cb => {
               cb.addEventListener('change', () => _saveEpModelState(epId, panel));
             });
+            _syncEpModelsBadge(row, sortedModels.length - hiddenSet.size, sortedModels.length);
           };
           try {
             const res = await fetch(`/api/model-endpoints/${epId}/models`, { credentials: 'same-origin' });
@@ -762,17 +763,20 @@ async function _saveEpModelState(epId, panel) {
       credentials: 'same-origin',
       body: JSON.stringify({ hidden }),
     });
+    const enabled = total - hidden.length;
     const countLabel = panel.querySelector('.mcp-tools-count');
-    if (countLabel) countLabel.textContent = `${total - hidden.length}/${total} enabled`;
+    if (countLabel) countLabel.textContent = `${enabled}/${total} enabled`;
     const row = panel.closest('[data-adm-ep-id]');
-    if (row) {
-      const badge = row.querySelector('.admin-badge');
-      if (badge && !badge.classList.contains('admin-badge-off')) badge.textContent = `${total - hidden.length}/${total} models enabled`;
-    }
+    if (row) _syncEpModelsBadge(row, enabled, total);
     if (settingsModule && typeof settingsModule.refreshAiModelEndpoints === 'function') {
       settingsModule.refreshAiModelEndpoints();
     }
   } catch (e) { /* silent */ }
+}
+
+function _syncEpModelsBadge(row, enabled, total) {
+  const badge = row.querySelector('[data-adm-models-badge]');
+  if (badge) badge.textContent = `${enabled}/${total} models enabled`;
 }
 
 function initEndpointForm() {
@@ -788,7 +792,12 @@ function initEndpointForm() {
   const pickerMenu = el('adm-provider-menu');
   const pickerCurrent = picker ? picker.querySelector('.adm-provider-current') : null;
   const DEVICE_AUTH_PROVIDER_VALUES = new Set(Object.keys(PROVIDER_DEVICE_FLOWS));
+  const CURSOR_SDK_PROVIDER_VALUE = 'cursor-sdk://local';
   let deviceAuthPolling = false;
+  function _isCursorSdkSelected() {
+    const opt = _selectedProviderOption();
+    return !!(opt && opt.dataset && opt.dataset.providerKind === 'cursor-sdk');
+  }
   function _selectedProviderOption() {
     return provider && provider.selectedOptions ? provider.selectedOptions[0] : null;
   }
@@ -809,6 +818,8 @@ function initEndpointForm() {
     const addBtn = el('adm-epAddBtn');
     const status = el('adm-deviceAuthStatus');
     const msg = _endpointMsg('api');
+    const cursorWorkspaceRow = el('adm-cursorWorkspace-row');
+    if (cursorWorkspaceRow) cursorWorkspaceRow.style.display = _isCursorSdkSelected() ? '' : 'none';
     if (deviceAuthConfig) {
       urlInput.value = '';
       urlInput.placeholder = deviceAuthProvider === 'copilot'
@@ -832,6 +843,30 @@ function initEndpointForm() {
         addBtn.style.display = '';
       }
       if (kindSel) kindSel.value = 'api';
+      if (msg) {
+        msg.textContent = '';
+        msg.className = '';
+      }
+    } else if (_isCursorSdkSelected()) {
+      urlInput.value = CURSOR_SDK_PROVIDER_VALUE;
+      urlInput.placeholder = 'Cursor SDK local agent';
+      urlInput.readOnly = true;
+      if (apiKey) {
+        apiKey.placeholder = 'Optional — env or ~/.cursor/worker.env';
+        apiKey.disabled = false;
+      }
+      if (testBtn) {
+        testBtn.disabled = false;
+        testBtn.style.opacity = '';
+        testBtn.style.cursor = '';
+      }
+      if (addBtn) {
+        addBtn.disabled = false;
+        addBtn.textContent = 'Add';
+        addBtn.style.width = '55px';
+        addBtn.style.display = '';
+      }
+      if (kindSel) kindSel.value = 'local';
       if (msg) {
         msg.textContent = '';
         msg.className = '';
@@ -916,9 +951,12 @@ function initEndpointForm() {
       _syncPickerCurrent();
       return;
     }
-    if (provider.value) urlInput.value = provider.value;
+    if (_isCursorSdkSelected()) {
+      urlInput.value = CURSOR_SDK_PROVIDER_VALUE;
+      if (kindSel) kindSel.value = 'local';
+    } else if (provider.value) urlInput.value = provider.value;
     else urlInput.value = '';
-    if (kindSel) kindSel.value = provider.value ? 'api' : 'proxy';
+    if (kindSel && !_isCursorSdkSelected()) kindSel.value = provider.value ? 'api' : 'proxy';
     _setApiFormForProvider();
   });
   urlInput.addEventListener('input', () => {
@@ -1070,9 +1108,12 @@ function initEndpointForm() {
     const rawUrl = (urlInput.value || provider.value).trim();
     const apiKey = el('adm-epApiKey').value.trim();
     if (!rawUrl) { msg.textContent = 'Select a provider or enter a base URL'; msg.className = 'admin-error'; return; }
-    if (provider.value && !apiKey) { msg.textContent = 'API key is required for cloud providers'; msg.className = 'admin-error'; return; }
-    // Normalize URL (fix typos, add /v1, strip wrong paths)
-    const url = provider.value && rawUrl === provider.value ? rawUrl : _normalizeBaseUrl(rawUrl);
+    if (provider.value && !apiKey && !_isCursorSdkSelected()) { msg.textContent = 'API key is required for cloud providers'; msg.className = 'admin-error'; return; }
+    let url = provider.value && rawUrl === provider.value ? rawUrl : _normalizeBaseUrl(rawUrl);
+    if (_isCursorSdkSelected()) {
+      const ws = (el('adm-cursorWorkspace') && el('adm-cursorWorkspace').value || '').trim();
+      url = ws ? (CURSOR_SDK_PROVIDER_VALUE + '?cwd=' + encodeURIComponent(ws)) : CURSOR_SDK_PROVIDER_VALUE;
+    }
     const btn = el('adm-epAddBtn');
     btn.disabled = true; btn.textContent = 'Adding...';
     try {

@@ -85,6 +85,19 @@ def test_detail_rejects_cross_owner_and_null_owner_reports(tmp_path, monkeypatch
         assert exc.value.status_code == 404
 
 
+def test_report_link_returns_signed_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    data_dir = tmp_path / "data" / "deep_research"
+    _write_research(data_dir, "alice-report", owner="alice", result="ok")
+
+    router = setup_research_routes(_research_handler())
+    target = _route(router, "/api/research/report-link/{session_id}", "GET")
+
+    out = asyncio.run(target(session_id="alice-report", request=_request("alice")))
+    assert out["path"].startswith("/api/research/report/alice-report?access=")
+    assert "access=" in out["url"]
+
+
 def test_report_rejects_null_owner_before_generating_html(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     data_dir = tmp_path / "data" / "deep_research"

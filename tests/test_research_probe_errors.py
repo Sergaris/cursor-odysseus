@@ -38,6 +38,13 @@ def test_probe_failure_keeps_reachability_guidance_for_plain_errors():
     assert msg == "Cannot reach model 'local-model' — connection refused"
 
 
+def test_probe_failure_reports_timeout():
+    msg = _format_probe_failure("default", TimeoutError())
+
+    assert "timed out" in msg
+    assert "default" in msg
+
+
 @pytest.mark.asyncio
 async def test_probe_endpoint_surfaces_http_exception_detail(monkeypatch):
     async def _raise(*args, **kwargs):

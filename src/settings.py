@@ -90,6 +90,16 @@ DEFAULT_SETTINGS = {
     "serper_api_key": "",
     "research_endpoint_id": "",
     "research_model": "",
+    # Deep Research brain: "http" (OpenAI-compat endpoint) or "cursor_sdk".
+    "research_brain_provider": "http",
+    "research_brain_model": "composer-2.5",
+    # Абсолютный путь workspace для Cursor SDK local agent; пусто = корень приложения.
+    "cursor_workspace": "",
+    # Опциональный override API-ключа; иначе env CURSOR_API_KEY или ~/.cursor/worker.env.
+    "cursor_api_key": "",
+    # Hybrid mode: при research_brain_provider=cursor_sdk per-URL extract через HTTP.
+    "research_extract_endpoint_id": "",
+    "research_extract_model": "",
     "research_search_provider": "",
     "research_max_tokens": 16384,
     "research_extraction_timeout_seconds": 90,

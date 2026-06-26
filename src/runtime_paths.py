@@ -23,8 +23,29 @@ def get_default_data_dir() -> str:
     In normal runs, this is a 'data' subdirectory under the app root.
     In frozen builds, it is a persistent user directory (~/.odysseus/data)
     to prevent SQLite databases and other persistent files from being
-    written to the ephemeral, temporary extraction bundle directory.
+    written to the ephemeral, temporary extraction directory.
     """
     if getattr(sys, "frozen", False):
         return os.path.join(os.path.expanduser("~"), ".odysseus", "data")
     return os.path.join(get_app_root(), "data")
+
+
+def get_install_dir() -> str:
+    """Return the directory that contains Odysseus.exe (not PyInstaller _MEIPASS)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return get_app_root()
+
+
+def get_default_workspace_dir() -> str:
+    """Return the default Cursor SDK / agent workspace directory."""
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.expanduser("~"), ".odysseus", "workspace")
+    return get_app_root()
+
+
+def ensure_default_workspace_dir() -> str:
+    """Creates the default workspace directory if missing."""
+    workspace = get_default_workspace_dir()
+    os.makedirs(workspace, exist_ok=True)
+    return workspace

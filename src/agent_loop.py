@@ -908,7 +908,12 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         domains.add("web")
     if has(r"\b(research|deep dive|investigate|look into)\b"):
         domains.add("web")
-    if has(r"\b(open|show|toggle|turn on|turn off|disable|enable|switch model|change model|settings|theme|panel)\b"):
+    if has(r"\b(open|show|toggle|turn on|turn off|disable|enable|switch model|change model|settings|theme|panel|language|locale)\b"):
+        domains.add("ui")
+    if has(
+        r"\b(язык|русск|локал|настройк|интерфейс|тем[аы]|панел|включ|выключ|открой|покаж)\b",
+        r"\b(sprache|spracheinstellung|idioma|langue)\b",
+    ):
         domains.add("ui")
     if has(r"\b(session|chat history|rename chat|delete chat|archive chat|fork chat|list chats)\b"):
         domains.add("sessions")
@@ -1997,13 +2002,11 @@ async def stream_agent_loop(
     _casual_low_signal_turn = _is_casual_low_signal(_last_user)
     _direct_low_signal = (
         _low_signal_turn
+        and _casual_low_signal_turn
         and not bool(_intent.get("continuation"))
         and not plan_mode
         and not approved_plan
         and not guide_only
-        and (_casual_low_signal_turn or active_document is None)
-        and (_casual_low_signal_turn or not active_email)
-        and (_casual_low_signal_turn or not workspace)
         and not forced_tools
         and not relevant_tools
     )
@@ -2312,7 +2315,12 @@ async def stream_agent_loop(
     # the fenced-block path is used instead of native function calling.
     _is_ollama_native = _is_ollama_native_url(endpoint_url or "")
     _ollama_openai_compat = _is_ollama_openai_compat_url(endpoint_url or "")
-    if _endpoint_supports is True:
+    try:
+        from src.cursor_sdk.provider import is_cursor_sdk_base
+        _is_cursor_sdk = is_cursor_sdk_base(endpoint_url or "")
+    except Exception:
+        _is_cursor_sdk = False
+    if _endpoint_supports is True and not _is_cursor_sdk:
         _is_api_model = True
     elif (
         _endpoint_supports is False
@@ -2323,6 +2331,9 @@ async def stream_agent_loop(
         _is_api_model = False
     else:
         _is_api_model = any(h in endpoint_url for h in _API_HOSTS) or _model_supports_tools
+    if _is_cursor_sdk:
+        # Cursor SDK bridge returns plain text only — Odysseus tools run via fenced blocks.
+        _is_api_model = False
     _compact_agent_prompt = _is_api_model or _is_ollama_native or _ollama_openai_compat
     messages, mcp_schemas = _build_system_prompt(
         messages, model, active_document, mcp_mgr, disabled_tools,
@@ -2449,6 +2460,21 @@ async def stream_agent_loop(
     actual_model = model
     total_tool_calls = 0  # for budget enforcement
 
+    _cursor_runtime = None
+    if _is_cursor_sdk and not guide_only:
+        from src.cursor_sdk.tool_enforcer import inject_cursor_sdk_tool_directive
+        from src.cursor_sdk.tool_runtime import CursorSdkToolRuntime
+
+        messages = inject_cursor_sdk_tool_directive(messages)
+        _cursor_runtime = CursorSdkToolRuntime(
+            session_id=session_id,
+            owner=owner,
+            workspace=workspace,
+            disabled_tools=frozenset(disabled_tools or ()),
+            relevant_tools=frozenset(_relevant_tools) if _relevant_tools else None,
+            tool_policy=tool_policy,
+        )
+
     # Loop-breaker state. Small models (e.g. deepseek-v4-flash) can get
     # stuck firing the same tool call over and over with no text — burns
     # all 20 rounds, looks like the chat "died". Track recent call
@@ -2495,6 +2521,8 @@ async def stream_agent_loop(
     # using tools — i.e. it was cut off, not finished. Drives a "Continue" event
     # so the user can resume instead of the turn silently stalling.
     _exhausted_rounds = False
+
+    _cursor_tool_nudge_count = 0
 
     for round_num in range(1, max_rounds + 1):
         round_response = ""
@@ -2564,8 +2592,8 @@ async def stream_agent_loop(
         # only switches on a pre-content failure, so streamed output is never
         # duplicated; the dead-host cooldown keeps repeat primary attempts cheap.
         _candidates = [(endpoint_url, model, headers)] + list(fallbacks or [])
-        # stream_llm enforces a per-read INACTIVITY timeout (httpx read=timeout),
-        # which kills a wedged/silent endpoint. This wall-clock deadline is the
+            # stream_llm enforces a per-read INACTIVITY timeout (httpx read=timeout),
+            # which kills a wedged/silent endpoint. This wall-clock deadline is the
         # complementary cap for the rare stream that trickles bytes forever and
         # so never trips the inactivity timeout. Generous — only catches runaway.
         _round_deadline = time.time() + max(agent_stream_timeout * 4, 1200)
@@ -2582,6 +2610,8 @@ async def stream_agent_loop(
             bool(all_tool_schemas),
             agent_stream_timeout,
         )
+        if _cursor_runtime is not None:
+            _cursor_runtime.round_num = round_num
         async for chunk in stream_llm_with_fallback(
             _candidates,
             messages,
@@ -2591,6 +2621,7 @@ async def stream_agent_loop(
             tools=all_tool_schemas if all_tool_schemas else None,
             timeout=agent_stream_timeout,
             session_id=session_id,
+            cursor_sdk_runtime=_cursor_runtime,
         ):
             if not _round_first_event_logged:
                 _round_first_event_logged = True
@@ -2691,6 +2722,10 @@ async def stream_agent_loop(
                         actual_model = data.get("model") or actual_model
                         data["requested_model"] = requested_model
                         yield f"data: {json.dumps(data)}\n\n"
+                    elif data.get("type") in (
+                        "tool_start", "tool_output", "tool_progress", "web_sources",
+                    ):
+                        yield chunk
                     elif "delta" in data:
                         if not first_token_received:
                             time_to_first_token = time.time() - total_start
@@ -2782,6 +2817,9 @@ async def stream_agent_loop(
             _round_first_event_logged,
             _round_first_token_logged,
         )
+        if _cursor_runtime is not None and _cursor_runtime.tool_events:
+            tool_events.extend(_cursor_runtime.tool_events)
+            _cursor_runtime.tool_events.clear()
         tool_blocks, used_native = _resolve_tool_blocks(
             round_response,
             native_tool_calls,
@@ -2875,6 +2913,45 @@ async def stream_agent_loop(
         round_texts.append(cleaned_round)
 
         if not tool_blocks:
+            if (
+                _is_cursor_sdk
+                and not guide_only
+                and _cursor_runtime is not None
+                and not _cursor_runtime.tools_executed
+                and _cursor_tool_nudge_count < 1
+            ):
+                from src.cursor_sdk.tool_enforcer import plan_mandatory_tool_blocks
+
+                _missing_tools = plan_mandatory_tool_blocks(
+                    user_message=_last_user,
+                    relevant_tools=_relevant_tools,
+                    disabled_tools=disabled_tools,
+                    tool_policy=tool_policy,
+                    forced_tools=forced_tools,
+                    executed_tools=_cursor_runtime.tools_executed,
+                )
+                if _missing_tools:
+                    _cursor_tool_nudge_count += 1
+                    _tool_names = ", ".join(b.tool_type for b in _missing_tools)
+                    logger.info(
+                        "[cursor-sdk] agent finished without tools; nudge round %s: %s",
+                        round_num,
+                        _tool_names,
+                    )
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "You ended the turn without calling required Odysseus tools "
+                            f"({ _tool_names }). Do NOT answer from memory or claim you "
+                            "searched. Call the matching native custom tool now — for "
+                            "weather/news use web_search with the user's query — then "
+                            "write the final answer from tool output only."
+                        ),
+                    })
+                    yield (
+                        f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                    )
+                    continue
             # ── Completion verifier (mechanism 3a) ────────────────────
             # The model is finishing. If this was an effectful agentic turn,
             # have a fresh-context verifier independently check the work

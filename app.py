@@ -415,6 +415,19 @@ if AUTH_ENABLED:
             # --- Cookie-based session auth ---
             token = request.cookies.get(SESSION_COOKIE)
             if not auth_manager.validate_token(token):
+                # Deep research HTML report: new tabs / external browsers have no
+                # session cookie. Accept a short-lived signed ?access= token instead.
+                if path.startswith("/api/research/report/"):
+                    session_id = path.rsplit("/", 1)[-1]
+                    access = request.query_params.get("access")
+                    if access:
+                        from src.research_report_access import verify_report_access
+
+                        report_user = verify_report_access(session_id, access)
+                        if report_user:
+                            request.state.current_user = report_user
+                            request.state.api_token = False
+                            return await call_next(request)
                 if path.startswith("/api/"):
                     return JSONResponse(status_code=401, content={"error": "Not authenticated"})
                 return RedirectResponse(url="/login", status_code=302)
@@ -663,6 +676,9 @@ app.include_router(setup_copilot_routes())
 # ChatGPT Subscription device-flow login
 from routes.chatgpt_subscription_routes import setup_chatgpt_subscription_routes
 app.include_router(setup_chatgpt_subscription_routes())
+
+from routes.cursor_sdk_routes import setup_cursor_sdk_routes
+app.include_router(setup_cursor_sdk_routes())
 
 # TTS
 from routes.tts_routes import setup_tts_routes
@@ -1151,6 +1167,37 @@ async def _startup_event():
     from src.cookbook_serve_lifecycle import cookbook_serve_lifecycle_loop
     _startup_tasks.append(asyncio.create_task(cookbook_serve_lifecycle_loop()))
 
+    async def _warmup_cursor_sdk_bridge() -> None:
+        try:
+            from src.cursor_sdk.async_runtime import prewarm_async_client
+            from src.cursor_sdk.model_discovery import (
+                refresh_cursor_sdk_endpoint_models,
+                set_main_event_loop,
+            )
+            from src.cursor_sdk.provider import resolve_cursor_sdk_cwd
+            from src.settings import get_setting
+
+            set_main_event_loop(asyncio.get_running_loop())
+
+            needs_bridge = get_setting("research_brain_provider", "http") == "cursor_sdk"
+            if not needs_bridge:
+                from core.database import ModelEndpoint, SessionLocal
+                db = SessionLocal()
+                try:
+                    needs_bridge = any(
+                        (ep.base_url or "").startswith("cursor-sdk://")
+                        for ep in db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)
+                    )
+                finally:
+                    db.close()
+            if needs_bridge:
+                await prewarm_async_client(resolve_cursor_sdk_cwd())
+                await refresh_cursor_sdk_endpoint_models()
+        except Exception as exc:
+            logger.warning("Cursor SDK bridge warmup skipped: %s", exc)
+
+    _startup_tasks.append(asyncio.create_task(_warmup_cursor_sdk_bridge()))
+
     logger.info("Application startup complete")
 
 async def _shutdown_event():
@@ -1176,6 +1223,11 @@ async def _shutdown_event():
         await mcp_manager.disconnect_all()
     except Exception as e:
         logger.warning(f"MCP shutdown error: {e}")
+    try:
+        from src.cursor_sdk.async_runtime import shutdown_async_clients
+        await shutdown_async_clients()
+    except Exception as e:
+        logger.warning(f"Cursor SDK shutdown error: {e}")
     logger.info("Application shutdown complete")
 
 
