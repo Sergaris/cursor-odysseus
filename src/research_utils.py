@@ -5,6 +5,8 @@ Centralizes text cleaning, quality filtering, and other logic
 used across deep_research.py, research_handler.py, and visual_report.py.
 """
 
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
 # ---------------------------------------------------------------------------
 # Thinking / reasoning block stripping
 # ---------------------------------------------------------------------------
@@ -61,3 +63,59 @@ def is_low_quality(summary: str) -> bool:
         return any(marker in low for marker in LOW_QUALITY_MARKERS)
     except Exception:
         return False  # fail open
+
+
+# ---------------------------------------------------------------------------
+# URL normalization (cheap semantic-ish dedup)
+# ---------------------------------------------------------------------------
+
+_TRACKING_QUERY_PREFIXES = ("utm_",)
+_TRACKING_QUERY_KEYS = frozenset({
+    "fbclid",
+    "gclid",
+    "mc_cid",
+    "mc_eid",
+    "ref",
+    "ref_src",
+    "source",
+    "spm",
+    "si",
+})
+
+
+def normalize_url(url: str) -> str:
+    """Normalize a URL for deduplication across research rounds.
+
+    Strips ``www.``, drops common tracking query params, sorts remaining
+    query keys, and removes fragments. Returns the original string when
+    parsing fails so callers can still use exact-string fallback.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return raw
+
+    scheme = (parsed.scheme or "https").lower()
+    netloc = (parsed.netloc or "").lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+
+    path = parsed.path or "/"
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+
+    query_items = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        key_l = key.lower()
+        if key_l in _TRACKING_QUERY_KEYS:
+            continue
+        if any(key_l.startswith(prefix) for prefix in _TRACKING_QUERY_PREFIXES):
+            continue
+        query_items.append((key, value))
+    query_items.sort(key=lambda item: (item[0].lower(), item[1]))
+    query = urlencode(query_items, doseq=True)
+
+    return urlunparse((scheme, netloc, path, "", query, ""))

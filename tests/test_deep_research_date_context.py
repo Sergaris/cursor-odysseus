@@ -33,6 +33,8 @@ def test_generate_queries_prompt_carries_the_current_year():
     r = DeepResearcher.__new__(DeepResearcher)
     r.research_plan = ""
     r.queries_used = set()
+    r.queries_round1 = 5
+    r.queries_followup = 4
 
     seen = {}
 
@@ -42,7 +44,7 @@ def test_generate_queries_prompt_carries_the_current_year():
 
     r._llm = _fake_llm
 
-    queries = asyncio.run(r._generate_queries("best python tutorials", "", 1))
+    queries = asyncio.run(r._generate_queries("best python tutorials", "", 1, []))
 
     assert queries  # sanity: the JSON array parsed
     # The fix: the real current year is in the prompt the LLM actually sees.

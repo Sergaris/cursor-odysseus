@@ -102,21 +102,24 @@ DEFAULT_SETTINGS = {
     "research_extract_model": "",
     "research_search_provider": "",
     "research_max_tokens": 16384,
-    "research_extraction_timeout_seconds": 90,
-    # Lightweight planning/query LLM calls happen before any search starts.
-    # Keep them separately tunable so slow local backends are not capped by
-    # the old 30s/60s per-call defaults.
-    "research_planning_timeout_seconds": 90,
-    "research_query_timeout_seconds": 90,
-    "research_extraction_concurrency": 3,
-    # Hard wall-clock cap on a single deep-research run. The previous 600s
-    # (10 min) default cut off slow local / edge LLMs mid-synthesis; 1800s
-    # (30 min) is comfortable for most local setups while still bounding
-    # runaway jobs. Set to 0 to disable the cap entirely (unlimited) — only
-    # for very long deep-research runs, since a stalled job then runs an
-    # unbounded model/API bill. Other values are bounded to [60, 86400].
-    # Tune via Settings or by editing data/settings.json.
-    "research_run_timeout_seconds": 1800,
+    # Per-LLM-call timeouts for Deep Research. 0 = no read/inference cap.
+    "research_extraction_timeout_seconds": 0,
+    "research_planning_timeout_seconds": 0,
+    "research_query_timeout_seconds": 0,
+    "research_heavy_llm_timeout_seconds": 0,
+    "research_extraction_concurrency": 8,
+    # Per-run budget inside DeepResearcher (rounds stop when exceeded). 0 = unlimited.
+    "research_max_time_seconds": 0,
+    "research_queries_round1": 5,
+    "research_queries_followup": 4,
+    "research_max_urls_per_query": 5,
+    # Hard wall-clock cap on a single deep-research run. 0 = no limit (asyncio
+    # wait_for disabled). Any other value is bounded to [60, 86400].
+    "research_run_timeout_seconds": 0,
+    # Query-aware page compression before LLM extract: heuristic | provence | off.
+    "research_compression_backend": "heuristic",
+    # Embedding coverage score threshold for early stop (0..1). 0 disables.
+    "research_coverage_threshold": 0.75,
     "agent_max_tool_calls": 0,
     "agent_max_rounds": 20,  # per-message agent step cap (clamped 1..200)
     # Soft input-token budget for the agent loop. The DEFAULT value (6000) is the
@@ -136,7 +139,7 @@ DEFAULT_SETTINGS = {
     # want to actually use (e.g. 900_000 to fill a 1M-context model). See
     # `compute_input_token_budget`.
     "agent_input_token_hard_max": 200_000,
-    "agent_stream_timeout_seconds": 300,
+    "agent_stream_timeout_seconds": 900,
     # Extra directory roots that read_file / write_file may access, in
     # addition to the built-in project data/ and system temp dirs. Each
     # entry is an absolute path. Sensitive subpaths (.ssh, .gnupg, shell
@@ -219,6 +222,140 @@ DEFAULT_FEATURES = {
 
 # ── Settings (data/settings.json) ──
 
+_PORTABLE_FALLBACK_PROVIDER = "duckduckgo"
+
+
+def _is_local_host_url(url: str) -> bool:
+    """True if URL points at this machine (default SearXNG docker target)."""
+    try:
+        from urllib.parse import urlparse
+
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
+def sync_portable_search_at_startup() -> None:
+    """На старте portable exe: дождаться/повторить SearXNG и обновить кэш настроек."""
+    from src.frozen_runtime import is_frozen
+
+    if not is_frozen():
+        return
+    from src.bundled_searxng import (
+        get_bundled_searxng_url,
+        is_bundled_probe_finished,
+        retry_bundled_searxng_startup,
+        schedule_bundled_searxng_background,
+    )
+
+    if get_bundled_searxng_url():
+        _invalidate_caches()
+        return
+
+    if is_bundled_probe_finished():
+        url = retry_bundled_searxng_startup()
+        if url:
+            persist_portable_search_defaults()
+        else:
+            persist_portable_search_defaults(fallback_only=True)
+        _invalidate_caches()
+        return
+
+    schedule_bundled_searxng_background()
+
+
+def _apply_portable_search_overlay(settings: dict) -> dict:
+    """Portable: bundled SearXNG URL или DuckDuckGo fallback."""
+    from src.bundled_searxng import (
+        get_bundled_searxng_url,
+        is_bundled_probe_finished,
+        resolve_bundled_searxng_url,
+    )
+    from src.frozen_runtime import is_frozen
+
+    if not is_frozen():
+        return settings
+
+    bundled_url = get_bundled_searxng_url()
+    if not bundled_url and is_bundled_probe_finished():
+        bundled_url = resolve_bundled_searxng_url(adopt=True)
+    if bundled_url:
+        patched = {
+            **settings,
+            "search_provider": "searxng",
+            "search_url": bundled_url,
+        }
+        research_sp = (patched.get("research_search_provider") or "").strip()
+        if research_sp == "searxng" or not research_sp:
+            patched["research_search_provider"] = ""
+        return patched
+
+    url = (settings.get("search_url") or "").strip()
+    if url and not _is_local_host_url(url):
+        return settings
+    provider = (settings.get("search_provider") or "searxng").strip()
+    if provider != "searxng" and not url:
+        return settings
+    patched = {
+        **settings,
+        "search_provider": _PORTABLE_FALLBACK_PROVIDER,
+        "search_url": "",
+    }
+    research_sp = (patched.get("research_search_provider") or "").strip()
+    if research_sp == "searxng":
+        patched["research_search_provider"] = ""
+    return patched
+
+
+def persist_portable_search_defaults(*, fallback_only: bool = False) -> None:
+    """Записывает search_provider/search_url для portable (SearXNG или fallback)."""
+    from pathlib import Path
+
+    from src.bundled_searxng import (
+        get_bundled_searxng_url,
+        is_bundled_probe_finished,
+        resolve_bundled_searxng_url,
+    )
+    from src.frozen_runtime import is_frozen
+
+    if not is_frozen():
+        return
+    path = Path(SETTINGS_FILE)
+    try:
+        if path.is_file():
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(saved, dict):
+                saved = {}
+        else:
+            saved = {}
+    except (json.JSONDecodeError, OSError):
+        saved = {}
+
+    bundled_url = get_bundled_searxng_url()
+    if not bundled_url and is_bundled_probe_finished():
+        bundled_url = resolve_bundled_searxng_url(adopt=True)
+    if bundled_url:
+        desired_provider = "searxng"
+        desired_url = bundled_url
+    else:
+        merged = _apply_portable_search_overlay({**DEFAULT_SETTINGS, **saved})
+        desired_provider = merged.get("search_provider", "searxng")
+        desired_url = merged.get("search_url") or ""
+
+    if saved.get("search_provider") == desired_provider and (saved.get("search_url") or "") == desired_url:
+        return
+
+    to_save = {**saved}
+    to_save["search_provider"] = desired_provider
+    to_save["search_url"] = desired_url
+    if bundled_url:
+        to_save["research_search_provider"] = ""
+    elif (saved.get("research_search_provider") or "").strip() == "searxng":
+        to_save["research_search_provider"] = ""
+    save_settings(to_save)
+
+
 def load_settings() -> dict:
     """Load settings merged with defaults. Always returns a complete dict."""
     global _settings_cache
@@ -233,6 +370,7 @@ def load_settings() -> dict:
         merged = {**DEFAULT_SETTINGS, **saved}
     except (FileNotFoundError, PermissionError, json.JSONDecodeError, ValueError):
         merged = dict(DEFAULT_SETTINGS)
+    merged = _apply_portable_search_overlay(merged)
     _settings_cache = (now, merged)
     return merged
 

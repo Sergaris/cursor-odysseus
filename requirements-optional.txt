@@ -39,6 +39,11 @@ markitdown[docx,pptx,xlsx,xls]==0.1.6
 # Optional: without it, Settings → Research shows a clear install hint on probe.
 cursor-sdk
 
+# Query-aware context compression for Deep Research extraction (Provence-style).
+# Optional: Settings → research_compression_backend=provence. Without it the
+# heuristic compressor is used (default).
+open_provence
+
 # Matplotlib for agent python tool charts (headless Agg backend).
 # numpy is already in requirements.txt.
 matplotlib

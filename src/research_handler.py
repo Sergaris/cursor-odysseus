@@ -32,6 +32,28 @@ def _bounded_int(value, *, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, n))
 
 
+def _resolve_research_timeout(value, *, default: int = 0) -> int | None:
+    """Map settings/API timeout to seconds, or None when unlimited (0 or less)."""
+    if value is None:
+        value = default
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return None if n <= 0 else n
+
+
+def _resolve_research_max_time(value, *, default: int = 0) -> int:
+    """Loop budget inside DeepResearcher; 0 means unlimited."""
+    if value is None:
+        value = default
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, n)
+
+
 def _format_probe_failure(model: str, exc: Exception) -> str:
     """Turn a failed research model probe into a user-facing message."""
     detail = getattr(exc, "detail", None)
@@ -338,24 +360,23 @@ class ResearchHandler:
         query: str,
         llm_endpoint: str,
         llm_model: str,
-        max_time: int = 300,
+        max_time: int | None = None,
         hard_timeout: int = None,
         llm_headers: dict = None,
         on_complete: callable = None,
         prior_report: str = "",
         prior_findings: list = None,
         prior_urls: set = None,
-        max_rounds: int = 20,
+        max_rounds: int = 10,
         search_provider: str = None,
-        category: str = None,
         extraction_timeout: int = None,
         extraction_concurrency: int = None,
         owner: str = "",
     ) -> dict:
         """Start research as a background task. Returns task info dict.
 
-        max_rounds is the safety cap; the AI's _should_stop decision (after
-        min_rounds) terminates the loop earlier in normal operation.
+        max_rounds is the safety cap; coverage check (after min_rounds)
+        terminates the loop earlier in normal operation.
         """
         if _research_json_path(session_id) is None:
             raise ValueError("Invalid research session_id")
@@ -369,18 +390,25 @@ class ResearchHandler:
         if hard_timeout is None:
             from src.settings import get_setting
             try:
-                raw_timeout = int(get_setting("research_run_timeout_seconds", 1800))
+                raw_timeout = int(get_setting("research_run_timeout_seconds", 0))
             except (TypeError, ValueError):
-                raw_timeout = 1800
+                raw_timeout = 0
             if raw_timeout <= 0:
                 hard_timeout = None  # 0 = no wall-clock cap (asyncio.wait_for timeout=None)
             else:
                 hard_timeout = _bounded_int(
                     raw_timeout,
-                    default=1800,
+                    default=7200,
                     minimum=60,
                     maximum=86400,
                 )
+
+        if max_time is None:
+            from src.settings import get_setting
+            max_time = _resolve_research_max_time(
+                get_setting("research_max_time_seconds", 0),
+                default=0,
+            )
 
         # Cancel any existing research for this session
         if session_id in self._active_tasks:
@@ -396,7 +424,6 @@ class ResearchHandler:
             "progress": {},
             "result": None,
             "started_at": time.time(),
-            "category": category,
             # SECURITY: track ownership so all reads / saves can filter by user.
             "owner": owner or "",
         }
@@ -431,7 +458,6 @@ class ResearchHandler:
                         prior_urls=prior_urls,
                         max_rounds=max_rounds,
                         search_provider=search_provider,
-                        category=category,
                         extraction_timeout=extraction_timeout,
                         extraction_concurrency=extraction_concurrency,
                         session_id=session_id,
@@ -452,13 +478,15 @@ class ResearchHandler:
             except asyncio.TimeoutError:
                 logger.error(f"Research hard timeout ({hard_timeout}s) for session {session_id}")
                 entry["status"] = "error"
-                # If we have partial results, save what we have
+                entry["failure_reason"] = "run_timeout"
                 researcher = entry.get("researcher")
-                if researcher and researcher.evolving_report:
-                    entry["result"] = self._format_research_report(
-                        query, researcher.evolving_report,
-                        researcher.get_stats(), hard_timeout,
-                    )
+                if researcher is not None:
+                    stats = dict(researcher.get_stats())
+                    stats["FailureReason"] = "run_timeout"
+                    entry["stats"] = stats
+                partial = await self._recover_partial_result(query, researcher)
+                if partial:
+                    entry["result"] = partial
                     entry["status"] = "done"
                     self._save_result(session_id, entry)
                     try:
@@ -469,20 +497,18 @@ class ResearchHandler:
                         logger.warning(f"on_complete callback failed in timeout branch: {e}")
                 else:
                     entry["result"] = f"Research timed out after {hard_timeout}s. The model may be too slow for deep research."
+                    self._save_result(session_id, entry)
                 on_progress({"phase": "error", "message": f"Research timed out after {hard_timeout}s"})
             except asyncio.CancelledError:
                 entry["status"] = "cancelled"
                 raise
             except Exception as e:
                 logger.error(f"Background research failed: {e}", exc_info=True)
-                # Preserve partial findings if available (mirrors timeout branch)
                 researcher = entry.get("researcher")
-                if researcher and researcher.evolving_report:
+                partial = await self._recover_partial_result(query, researcher)
+                if partial:
                     _elapsed = time.time() - entry["started_at"]
-                    entry["result"] = self._format_research_report(
-                        query, researcher.evolving_report,
-                        researcher.get_stats(), _elapsed,
-                    )
+                    entry["result"] = partial
                     entry["status"] = "done"
                     self._save_result(session_id, entry)
                     try:
@@ -726,7 +752,10 @@ class ResearchHandler:
                 "sources": sources,
                 "raw_findings": raw_findings,
                 "stats": entry.get("stats"),
-                "category": entry.get("category"),
+                "failure_reason": entry.get("failure_reason") or (entry.get("stats") or {}).get("FailureReason", ""),
+                "scratchpad": getattr(researcher, "scratchpad", "") if researcher else "",
+                "citations": getattr(researcher, "citation_map", []) if researcher else [],
+                "category": "",
                 "started_at": entry["started_at"],
                 "completed_at": time.time(),
                 # SECURITY: stamp owner so route handlers can filter by user.
@@ -773,7 +802,6 @@ class ResearchHandler:
                 report_markdown=report_md,
                 sources=data.get("sources"),
                 stats=data.get("stats"),
-                category=data.get("category"),
                 session_id=session_id,
                 hidden_images=data.get("hidden_images") or [],
             )
@@ -821,41 +849,56 @@ class ResearchHandler:
             return False
 
     @staticmethod
-    async def _probe_endpoint(endpoint: str, model: str, headers: dict = None):
-        """Quick probe to verify the LLM endpoint/model responds before research."""
+    async def _probe_endpoint(
+        endpoint: str,
+        model: str,
+        headers: dict = None,
+        *,
+        chat_timeout: int = 45,
+    ) -> None:
+        """Verify the LLM endpoint responds to a short chat completion before research."""
         from src.llm_core import llm_call_async
+
         try:
-            logger.info(f"Probing {model} at {endpoint} (has_auth={bool(headers and 'Authorization' in (headers or {}))})")
+            logger.info(
+                "Probing %s at %s (chat_timeout=%ss, has_auth=%s)",
+                model,
+                endpoint,
+                chat_timeout,
+                bool(headers and "Authorization" in (headers or {})),
+            )
             await llm_call_async(
                 url=endpoint,
                 model=model,
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[{"role": "user", "content": "Reply with OK only."}],
                 temperature=0,
-                max_tokens=5,
+                max_tokens=8,
                 headers=headers,
-                timeout=15,
+                timeout=chat_timeout,
                 max_retries=1,
             )
-            logger.info(f"Endpoint probe OK: {model}")
+            logger.info("Endpoint probe OK: %s", model)
         except Exception as e:
-            logger.error(f"Probe failed for {model}: {e}")
-            raise RuntimeError(_format_probe_failure(model, e)) from e
+            logger.error("Probe failed for %s: %s", model, e)
+            raise RuntimeError(
+                _format_probe_failure(model, e)
+                + f" Increase research timeout or choose a faster model (probe budget: {chat_timeout}s)."
+            ) from e
 
     async def call_research_service(
         self,
         query: str,
         llm_endpoint: str,
         llm_model: str,
-        max_time: int = 300,
+        max_time: int | None = None,
         progress_callback=None,
         _task_entry: dict = None,
         llm_headers: dict = None,
         prior_report: str = "",
         prior_findings: list = None,
         prior_urls: set = None,
-        max_rounds: int = 20,
+        max_rounds: int = 10,
         search_provider: str = None,
-        category: str = None,
         extraction_timeout: int = None,
         extraction_concurrency: int = None,
         session_id: str = "",
@@ -884,15 +927,19 @@ class ResearchHandler:
         if is_continuation:
             logger.info(f"Prior: {len(prior_findings or [])} findings, {len(prior_urls or set())} URLs")
 
+        from src.settings import get_setting
+        if max_time is None:
+            max_time = _resolve_research_max_time(
+                get_setting("research_max_time_seconds", 0),
+                default=0,
+            )
+
         cursor_backend = None
         cursor_registry = None
-        use_cursor = _is_cursor_research_brain()
-        if use_cursor:
-            from src.cursor_sdk.provider import CURSOR_SDK_BASE_URL
+        from src.cursor_sdk.provider import is_cursor_sdk_base
 
-            llm_endpoint = CURSOR_SDK_BASE_URL
-            llm_model = _cursor_research_model()
-            llm_headers = {}
+        use_cursor = is_cursor_sdk_base(llm_endpoint)
+        if use_cursor:
             try:
                 cursor_backend, cursor_registry = _build_cursor_research_backend(session_id)
                 if _task_entry is not None:
@@ -902,50 +949,36 @@ class ResearchHandler:
                 logger.error("Cursor SDK backend init failed: %s", e)
                 raise RuntimeError(_format_probe_failure(llm_model, e)) from e
 
-        # Probe the endpoint before committing to a long research run
-        if progress_callback:
-            progress_callback({"phase": "probing", "model": llm_model})
-        if use_cursor and cursor_backend is not None:
-            try:
-                await cursor_backend.probe(timeout=15)
-                logger.info("Cursor SDK probe OK: %s", llm_model)
-            except Exception as e:
-                logger.error("Cursor SDK probe failed for %s: %s", llm_model, e)
-                if cursor_backend is not None:
-                    cursor_backend.close()
-                raise RuntimeError(_format_probe_failure(llm_model, e)) from e
-        else:
-            await self._probe_endpoint(llm_endpoint, llm_model, llm_headers)
-
         try:
             from src.deep_research import DeepResearcher
 
-            from src.settings import get_setting
             _max_report_tokens = int(get_setting("research_max_tokens", 16384))
-            _extraction_timeout = _bounded_int(
-                extraction_timeout if extraction_timeout is not None else get_setting("research_extraction_timeout_seconds", 90),
-                default=90,
-                minimum=15,
-                maximum=3600,
-            )
+            # Deep Research never caps LLM read/inference time; slow local models
+            # may run as long as they need.
+            _extraction_timeout = None
+            _planning_timeout = None
+            _query_timeout = None
+            _heavy_llm_timeout = None
             _extraction_concurrency = _bounded_int(
-                extraction_concurrency if extraction_concurrency is not None else get_setting("research_extraction_concurrency", 3),
-                default=3,
+                extraction_concurrency if extraction_concurrency is not None else get_setting("research_extraction_concurrency", 8),
+                default=8,
                 minimum=1,
-                maximum=12,
+                maximum=16,
             )
-            _planning_timeout = _bounded_int(
-                get_setting("research_planning_timeout_seconds", _extraction_timeout),
-                default=_extraction_timeout,
-                minimum=15,
-                maximum=3600,
+            _queries_round1 = _bounded_int(
+                get_setting("research_queries_round1", 5),
+                default=5, minimum=1, maximum=12,
             )
-            _query_timeout = _bounded_int(
-                get_setting("research_query_timeout_seconds", _extraction_timeout),
-                default=_extraction_timeout,
-                minimum=15,
-                maximum=3600,
+            _queries_followup = _bounded_int(
+                get_setting("research_queries_followup", 4),
+                default=4, minimum=1, maximum=12,
             )
+            _max_urls_per_query = _bounded_int(
+                get_setting("research_max_urls_per_query", 5),
+                default=5, minimum=1, maximum=20,
+            )
+            _effective_max_rounds = max_rounds or 10
+            _min_rounds = max(2, min(_effective_max_rounds, 10) - 2)
 
             extract_url, extract_model, extract_headers = (None, None, None)
             if use_cursor:
@@ -957,25 +990,41 @@ class ResearchHandler:
                         extract_model,
                     )
 
+            try:
+                _coverage_threshold = float(get_setting("research_coverage_threshold", 0.75))
+            except (TypeError, ValueError):
+                _coverage_threshold = 0.75
+            _compression_backend = (
+                get_setting("research_compression_backend", "heuristic") or "heuristic"
+            ).strip().lower()
+            if _compression_backend not in {"heuristic", "provence", "off"}:
+                _compression_backend = "heuristic"
+
             researcher = DeepResearcher(
                 llm_endpoint=llm_endpoint,
                 llm_model=llm_model,
                 llm_headers=llm_headers,
-                max_rounds=max_rounds,
-                min_rounds=max(2, max_rounds - 2),
+                max_rounds=_effective_max_rounds,
+                min_rounds=_min_rounds,
                 max_time=max_time,
+                max_urls_per_query=_max_urls_per_query,
+                queries_round1=_queries_round1,
+                queries_followup=_queries_followup,
                 max_report_tokens=_max_report_tokens,
                 extraction_timeout=_extraction_timeout,
                 planning_timeout=_planning_timeout,
                 query_timeout=_query_timeout,
                 extraction_concurrency=_extraction_concurrency,
+                heavy_llm_timeout=_heavy_llm_timeout,
                 progress_callback=progress_callback,
                 search_provider=search_provider,
-                category=category,
                 cursor_backend=cursor_backend,
                 extract_llm_endpoint=extract_url,
                 extract_llm_model=extract_model,
                 extract_llm_headers=extract_headers,
+                session_id=session_id,
+                compression_backend=_compression_backend,
+                coverage_threshold=_coverage_threshold,
             )
             if _task_entry is not None:
                 _task_entry["researcher"] = researcher
@@ -990,7 +1039,13 @@ class ResearchHandler:
             elapsed = time.time() - start_time
 
             stats = researcher.get_stats()
-            logger.info("IterResearch completed successfully")
+            if stats.get("FailureReason") == "llm_extraction":
+                logger.warning(
+                    "Research finished with %s URLs but 0 extractions — LLM likely timed out",
+                    stats.get("URLs", "?"),
+                )
+            else:
+                logger.info("IterResearch completed successfully")
             for key, value in stats.items():
                 logger.info(f"  {key}: {value}")
 
@@ -1045,6 +1100,29 @@ class ResearchHandler:
             }
         except Exception:
             return {}
+
+    async def _recover_partial_result(self, query: str, researcher) -> str | None:
+        """Build a formatted report from partial scratchpad/findings on timeout/error."""
+        if not researcher:
+            return None
+        answer = ""
+        if getattr(researcher, "scratchpad", "") or getattr(researcher, "findings", None):
+            if researcher.scratchpad:
+                try:
+                    answer = await researcher._compose_answer(
+                        query,
+                        researcher.scratchpad,
+                        researcher.plan_sub_questions,
+                    )
+                except Exception as exc:
+                    logger.warning("Partial compose failed: %s", exc)
+            if not answer and researcher.findings:
+                answer = researcher._fallback_report(query, researcher.findings)
+        if not answer:
+            return None
+        stats = researcher.get_stats()
+        elapsed = time.time() - researcher._start_time if researcher._start_time else 0
+        return self._format_research_report(query, answer, stats, elapsed)
 
     def _format_research_report(
         self, query: str, full_report: str, stats: dict, elapsed: float,

@@ -1,33 +1,17 @@
-"""Regression tests for issue #1551 — deep research reported "No information
-could be gathered" and showed nothing, even though the search rounds had already
-extracted findings.
-
-Two root causes in src/deep_research.py:
-
-1. `_synthesize` hard-capped its LLM call at `timeout=60`, while extraction uses
-   the user's `extraction_timeout` (e.g. 300s) and the final report uses 180s. A
-   slow local model (the reporter served a 20B from LM Studio) needs >60s to
-   synthesize a round's findings, so synthesis timed out after 3 attempts.
-
-2. When synthesis failed on the first round, the gathered findings were thrown
-   away: `if not report: return "No information could be gathered…"`. The 8
-   findings the run had already extracted were lost.
-
-The fixes: give synthesis the same 180s budget as the final report, and fall
-back to a compiled report built from the gathered findings when synthesis
-produced nothing. These run without a live LLM or DB (same stub pattern as
-tests/test_deep_research_date_context.py).
-"""
+"""Regression tests for issue #1551 — deep research must not discard findings
+when scratchpad/compose LLM calls fail or time out."""
 import asyncio
+import json
 
 from src.deep_research import DeepResearcher
 
 
 def _researcher():
-    # Build without the heavy __init__; the methods under test only need these.
     r = DeepResearcher.__new__(DeepResearcher)
-    r.synthesis_window = 10
+    r.scratchpad_max_tokens = 4096
     r.max_report_tokens = 4096
+    r.findings = []
+    r.plan_sub_questions = []
     return r
 
 
@@ -39,40 +23,37 @@ _FINDINGS = [
 ]
 
 
-def test_synthesis_uses_a_generous_timeout_not_60s():
-    """The synthesis LLM call must get a budget consistent with the final report
-    (180s), not the old 60s that timed out on slow local models (#1551)."""
+def test_update_scratchpad_uses_generous_timeout():
+    """Scratchpad update must get 180s like compose (#1551)."""
     r = _researcher()
     seen = {}
 
     async def _fake_llm(messages, **kwargs):
         seen.update(kwargs)
-        return "synthesized report"
+        return json.dumps({"sub_topics": [], "insights": []})
 
     r._llm = _fake_llm
     r._emit = lambda **k: None
 
-    out = asyncio.run(r._synthesize("q", _FINDINGS, ""))
-    assert out == "synthesized report"
-    assert seen.get("timeout", 0) >= 180, f"synthesis timeout too short: {seen.get('timeout')}"
+    asyncio.run(r._update_scratchpad("q", [], "", _FINDINGS))
+    # Generous timeout: either explicit >=180s or None (unlimited) for local LLMs.
+    timeout = seen.get("timeout", 0)
+    assert timeout is None or timeout >= 180
 
 
 def test_fallback_report_preserves_findings():
-    """_fallback_report must surface the gathered findings (title + content),
-    not a 'nothing found' message."""
+    """_fallback_report must surface gathered findings, not a give-up message."""
     r = _researcher()
     report = r._fallback_report("how does speaker diarization work", _FINDINGS)
     assert "speaker diarization" in report.lower()
     assert "Diarization basics" in report
     assert "x-vectors" in report
     assert "https://ex.com/a" in report
-    # It must NOT be the give-up message.
     assert "No information could be gathered" not in report
 
 
-def test_synthesis_failure_keeps_previous_report():
-    """If synthesis raises, the previous report is preserved (not blanked) so the
-    findings survive the round and the fallback can use them."""
+def test_scratchpad_failure_keeps_previous_notes():
+    """If scratchpad update raises, previous scratchpad is preserved."""
     r = _researcher()
 
     async def _boom(messages, **kwargs):
@@ -81,6 +62,6 @@ def test_synthesis_failure_keeps_previous_report():
     r._llm = _boom
     r._emit = lambda **k: None
 
-    prev = "existing report body"
-    out = asyncio.run(r._synthesize("q", _FINDINGS, prev))
-    assert out == prev  # unchanged, not emptied
+    prev = "existing scratchpad body"
+    out = asyncio.run(r._update_scratchpad("q", [], prev, _FINDINGS))
+    assert out == prev

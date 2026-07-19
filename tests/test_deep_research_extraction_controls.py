@@ -36,7 +36,7 @@ class _ControlledResearcher(DeepResearcher):
 
 @pytest.mark.asyncio
 async def test_search_and_extract_respects_extraction_concurrency():
-    researcher = _ControlledResearcher(extraction_concurrency=2, max_urls_per_round=4)
+    researcher = _ControlledResearcher(extraction_concurrency=2, max_urls_per_query=4)
     researcher._start_time = time.time()
 
     findings = await researcher._search_and_extract(["a", "b"], "question")
@@ -47,7 +47,7 @@ async def test_search_and_extract_respects_extraction_concurrency():
 
 @pytest.mark.asyncio
 async def test_search_and_extract_tracks_all_urls_selected_for_analysis():
-    researcher = _ControlledResearcher(extraction_concurrency=2, max_urls_per_round=2)
+    researcher = _ControlledResearcher(extraction_concurrency=2, max_urls_per_query=2)
     researcher._start_time = time.time()
 
     findings = await researcher._search_and_extract(["a"], "question")
@@ -112,6 +112,77 @@ def test_extraction_timeout_allows_long_local_model_runs():
     assert researcher.extraction_timeout == 1800
 
 
+def test_extraction_timeout_zero_is_unlimited():
+    researcher = DeepResearcher(
+        llm_endpoint="http://local.test/v1/chat/completions",
+        llm_model="local-model",
+        extraction_timeout=0,
+    )
+
+    assert researcher.extraction_timeout is None
+
+
+@pytest.mark.asyncio
+async def test_get_stats_flags_llm_extraction_failure():
+    researcher = DeepResearcher(
+        llm_endpoint="http://local.test/v1/chat/completions",
+        llm_model="local-model",
+    )
+    researcher._start_time = time.time()
+    researcher.urls_fetched.add("https://example.test/a")
+    researcher.extract_ok = 0
+    stats = researcher.get_stats()
+    assert stats["FailureReason"] == "llm_extraction"
+    assert stats["Extracted"] == 0
+    assert stats["URLs"] == 1
+
+
+@pytest.mark.asyncio
+async def test_extract_retries_with_smaller_content_on_timeout(monkeypatch):
+    import httpx
+    from fastapi import HTTPException
+
+    search_mod = types.ModuleType("src.search")
+
+    def fake_fetch_webpage_content(url, timeout):
+        return {
+            "success": True,
+            "content": "x" * 12000,
+            "title": "Page",
+            "og_image": "",
+        }
+
+    search_mod.fetch_webpage_content = fake_fetch_webpage_content
+    monkeypatch.setitem(sys.modules, "src.search", search_mod)
+
+    async def immediate_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+
+    researcher = DeepResearcher(
+        llm_endpoint="http://local.test/v1/chat/completions",
+        llm_model="local-model",
+    )
+    calls = {"n": 0}
+
+    async def flaky_llm(messages, temperature=0.3, max_tokens=4096, timeout=60):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise HTTPException(502, "POST http://local.test failed after 3 attempts: timed out")
+        return '{"summary": "ok", "evidence": "data", "rational": "yes"}'
+
+    researcher._llm_extract = flaky_llm
+
+    result = await researcher._fetch_and_extract("https://example.test", "question", "Title")
+
+    assert result is not None
+    assert result["summary"] == "ok"
+    assert calls["n"] == 2
+    assert researcher.extract_ok == 1
+    assert researcher.extract_timeout == 1
+
+
 @pytest.mark.asyncio
 async def test_planning_and_query_generation_use_configured_timeouts():
     researcher = DeepResearcher(
@@ -135,7 +206,7 @@ async def test_planning_and_query_generation_use_configured_timeouts():
     researcher._llm = fake_llm
 
     plan = await researcher._create_plan("question")
-    queries = await researcher._generate_queries("question", "", 1)
+    queries = await researcher._generate_queries("question", "", 1, [])
 
     assert "Sub-questions: one" in plan
     assert queries == ["query one", "query two"]

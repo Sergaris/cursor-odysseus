@@ -2,8 +2,8 @@
 """
 IterResearch-style deep research engine.
 
-Implements an iterative Think→Search→Extract→Synthesize loop where the LLM
-drives every decision: what to search, what's relevant, what's missing, and
+Implements an iterative Think→Search→Extract→Scratchpad→Compose loop where the
+LLM drives every decision: what to search, what's relevant, what's missing, and
 when to stop.  Inspired by Alibaba's IterResearch approach.
 """
 import asyncio
@@ -12,9 +12,12 @@ import logging
 import re
 import time
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Set
+from pathlib import Path
+from typing import Callable
+from urllib.parse import urlparse
 
-from src.research_utils import strip_thinking, is_low_quality
+from src.research_utils import strip_thinking, is_low_quality, normalize_url
+from src.scratchpad_schema import validate_scratchpad
 
 from src.goal_based_extractor import EXTRACTOR_SYSTEM
 from src.prompt_security import untrusted_context_message
@@ -69,114 +72,106 @@ You are a research assistant planning web searches.
 **Research plan:**
 {research_plan}
 
-**What we know so far:**
-{report}
+**Current scratchpad (coverage notes):**
+{scratchpad}
+
+**Gaps still to fill:**
+{gaps}
 
 **Round:** {round_num}
 
 Generate {num_queries} focused search queries that will help answer the question.
 {round_instruction}
 
-Return ONLY a JSON array of query strings, nothing else.
-Example: ["query one", "query two", "query three"]
+Use search operators when they improve depth:
+- site:github.com / site:arxiv.org / site:ietf.org for primary sources
+- filetype:pdf for reports and papers
+- after:YYYY-MM-DD (or year) for recent material
+- quoted "exact phrases" for rare claims
+
+Prefer diverse strategies across the set (web, academic, github, news, pdf).
+
+CRITICAL: Reply with ONLY a JSON array — no prose, no refusal, no markdown fences.
+Preferred form (objects with strategy tags):
+[
+  {{"query": "topic site:arxiv.org", "strategy": "academic"}},
+  {{"query": "topic site:github.com/issues", "strategy": "github"}},
+  {{"query": "topic filetype:pdf", "strategy": "pdf"}},
+  {{"query": "topic after:2025-01-01", "strategy": "news"}},
+  {{"query": "plain web query", "strategy": "web"}}
+]
+Also accepted: ["query one", "query two"] (strategy defaults to "web").
 """
 
-SYNTHESIZE_PROMPT = """\
-You are updating an evolving research report.
-
-**Original question:** {question}
-
-**Current report:**
-{report}
-
-**New findings from this round:**
-{new_findings}
-
-Integrate the new findings into the existing report. Produce an updated, well-organized \
-report that answers the original question as completely as possible given all evidence so far. \
-Remove redundancy, resolve contradictions, and maintain logical flow. \
-Keep source URLs as inline citations where relevant.
-
-Write only the updated report — no preamble or meta-commentary.
-"""
-
-STOP_PROMPT = """\
-You are deciding whether a research report is comprehensive enough.
-
-**Original question:** {question}
-
-**Current report:**
-{report}
-
-**Rounds completed:** {round_num} of {max_rounds}
-
-Based on the report so far, do we have enough information to answer the question \
-comprehensively?  Consider:
-- Are the key aspects of the question addressed?
-- Are there obvious gaps or unanswered sub-questions?
-- Is the evidence sufficient and from multiple sources?
-
-If rounds completed is well below the target, prefer continuing unless the \
-report is already exhaustive.
-
-Reply with ONLY "YES" or "NO" followed by a brief one-sentence reason.
-Example: "YES — The report covers all major aspects with evidence from multiple sources."
-Example: "NO — We still lack information about the economic impact."
-"""
-
-FINAL_REPORT_PROMPT = """\
-Write a **long, detailed, comprehensive** research report answering this question:
+SCRATCHPAD_UPDATE_PROMPT = """\
+You are maintaining a structured research scratchpad (NOT a user-facing article).
 
 **Question:** {question}
 
-**All collected evidence and analysis:**
-{report}
+**Research plan sub-questions:**
+{sub_questions}
 
-Requirements:
-- Write at MINIMUM 1500 words — this should be a thorough, magazine-quality article
-- Use clear ## headings and ### subheadings to organize into logical sections
-- Each section should have multiple detailed paragraphs, not just bullet points
-- Synthesize and analyze the information — explain WHY things matter, draw comparisons, provide context
-- Include specific data points, numbers, and statistics from the evidence
-- Include source URLs as inline citations [like this](url)
-- Note where sources agree and where they disagree
-- Add a brief executive summary at the top
-- End with a clear conclusion that directly answers the question
-- Write in an engaging, informative style — not dry or robotic
+**Current scratchpad:**
+{scratchpad}
+
+**New findings this round (summary + url only):**
+{new_findings}
+
+Update the scratchpad. For EACH sub-question include:
+- status: covered | partial | missing
+- key_facts: bullet list with source URLs inline
+- gaps: what still needs searching (empty if covered)
+- conflicts: disagreements between sources (empty if none)
+
+Output valid JSON:
+{{
+  "sub_topics": [
+    {{"question": "...", "status": "partial", "key_facts": ["..."], "gaps": ["..."], "conflicts": ["..."]}}
+  ],
+  "insights": ["2-4 concise bullets for UI — key discoveries this round"]
+}}
+
+Do NOT write a flowing essay. Be factual and compact.
 """
 
-CATEGORY_PROMPTS = {
-    "product": """IMPORTANT FORMAT OVERRIDE — this is a PRODUCT research report:
-- Structure as a RANKED LIST of products/options (best first)
-- For EACH product include: name as ### heading, approximate price, 2-3 sentence summary, **Pros:** bullet list, **Cons:** bullet list, **Where to buy:** URLs as links
-- Start with a quick-compare markdown table of top picks (columns: Name, Price, Best For, Rating)
-- End with a ## Verdict section picking Best Overall and Best Value
-- Still include source citations inline""",
+COVERAGE_STOP_PROMPT = """\
+Decide if research coverage is sufficient to write the final answer.
 
-    "comparison": """IMPORTANT FORMAT OVERRIDE — this is a COMPARISON report:
-- Create a ## Comparison Table as a markdown table comparing ALL options across key criteria (rows = criteria, columns = options)
-- Use checkmarks, ratings, or short values in cells
-- Write a ## section per option with its strengths, weaknesses, and ideal use case
-- End with ## Best For verdicts (e.g., "**Best for small teams:** Option A because...")
-- Include a ## Shared Considerations section for things that apply to all options""",
+**Question:** {question}
+**Sub-questions:** {sub_questions}
+**Scratchpad:** {scratchpad}
+**Round:** {round_num} of {max_rounds}
 
-    "howto": """IMPORTANT FORMAT OVERRIDE — this is a HOW-TO guide:
-- Start with ## Quick Guide — a super concise numbered list (one line per step, no details, just the action). Example: 1. Install X  2. Run Y  3. Configure Z
-- Then ## Prerequisites listing what's needed before starting
-- Then the detailed steps: ## Step 1: ..., ## Step 2: ...
-- Each step should have a clear heading and detailed instructions
-- Use blockquotes (> ) for tips and warnings: > **Tip:** ... or > **Warning:** ...
-- End with ## Common Mistakes section
-- Add estimated time and difficulty level near the top""",
+Stop (YES) when:
+- Every sub-question is covered or partial with evidence from at least 2 independent sources
+- Remaining gaps are unlikely to be filled by more searching
 
-    "factcheck": """IMPORTANT FORMAT OVERRIDE — this is a FACT-CHECK report:
-- Start with ## The Claim restating what's being checked
-- Create ## Evidence For and ## Evidence Against sections
-- Each piece of evidence should be a ### with source name, what it found, and how strong the evidence is
-- Include a ## Verdict section with one of: **Supported**, **Mixed Evidence**, or **Unsupported**
-- End with ## Nuance & Caveats for important context and limitations
-- Be balanced and cite sources for every claim""",
-}
+Continue (NO) when obvious gaps remain and rounds budget allows.
+
+Reply: YES or NO — one sentence reason.
+"""
+
+FINAL_ANSWER_PROMPT = """\
+Write the final research answer for the user.
+
+**Question:** {question}
+**Research scratchpad (all evidence gathered):**
+{scratchpad}
+
+**Source index for citations:**
+{citation_index}
+
+Requirements:
+- Lead with a direct answer to the question
+- Include facts, numbers, nuances that justify the depth of research
+- Choose format yourself (prose, bullets, table, sections) — no fixed template
+- No filler, no "in this article", no repetition
+- Cite inline immediately after claims: [^1], [^2] (no space before bracket)
+- Up to 3 citation numbers per sentence
+- Do NOT add a References section — sources are shown separately in the UI
+- If data is incomplete for a sub-topic, state it briefly; do not invent
+- Length: as much as needed for completeness — no minimum or maximum word count
+"""
 
 # ---------------------------------------------------------------------------
 # DeepResearcher
@@ -186,33 +181,41 @@ class DeepResearcher:
     Iterative research engine following the IterResearch pattern.
 
     Each round: LLM generates queries → SearXNG search → LLM extracts from
-    top pages → LLM synthesizes into evolving report → LLM decides continue/stop.
+    top pages → LLM updates scratchpad → LLM decides continue/stop → compose answer.
     """
 
     def __init__(
         self,
         llm_endpoint: str,
         llm_model: str,
-        llm_headers: Optional[Dict] = None,
-        max_rounds: int = 8,
+        llm_headers: dict | None = None,
+        max_rounds: int = 10,
         max_time: int = 300,
-        max_urls_per_round: int = 3,
+        max_urls_per_query: int = 5,
+        queries_round1: int = 5,
+        queries_followup: int = 4,
         max_content_chars: int = 15000,
         max_report_tokens: int = 8192,
-        extraction_timeout: int = 90,
-        planning_timeout: int = 90,
-        query_timeout: int = 120,
+        scratchpad_max_tokens: int = 4096,
+        extraction_timeout: int | None = 0,
+        planning_timeout: int | None = 0,
+        query_timeout: int | None = 0,
         extraction_concurrency: int = 3,
+        heavy_llm_timeout: int | None = 0,
         min_rounds: int = 2,
         max_empty_rounds: int = 2,
-        synthesis_window: int = 10,
-        progress_callback: Optional[Callable] = None,
-        search_provider: Optional[str] = None,
-        category: Optional[str] = None,
+        progress_callback: Callable | None = None,
+        search_provider: str | None = None,
         cursor_backend=None,
-        extract_llm_endpoint: Optional[str] = None,
-        extract_llm_model: Optional[str] = None,
-        extract_llm_headers: Optional[Dict] = None,
+        extract_llm_endpoint: str | None = None,
+        extract_llm_model: str | None = None,
+        extract_llm_headers: dict | None = None,
+        evidence_store=None,
+        session_id: str = "",
+        compression_backend: str = "heuristic",
+        coverage_threshold: float = 0.75,
+        # Backward compat alias — deprecated, use max_urls_per_query
+        max_urls_per_round: int | None = None,
     ):
         self.llm_endpoint = llm_endpoint
         self.llm_model = llm_model
@@ -222,33 +225,80 @@ class DeepResearcher:
         self.extract_llm_model = (extract_llm_model or "").strip() or None
         self.extract_llm_headers = extract_llm_headers
         self.search_provider_override = search_provider
-        self.category = category
         self.max_rounds = max_rounds
         self.max_time = max_time
-        self.max_urls_per_round = max_urls_per_round
+        if max_urls_per_round is not None:
+            self.max_urls_per_query = max_urls_per_round
+        else:
+            self.max_urls_per_query = max_urls_per_query
+        self.queries_round1 = queries_round1
+        self.queries_followup = queries_followup
         self.max_content_chars = max_content_chars
         self.max_report_tokens = max_report_tokens
-        self.extraction_timeout = min(3600, max(15, int(extraction_timeout or 90)))
-        self.planning_timeout = min(3600, max(15, int(planning_timeout or 90)))
-        self.query_timeout = min(3600, max(15, int(query_timeout or 120)))
-        self.extraction_concurrency = min(12, max(1, int(extraction_concurrency or 3)))
+        self.scratchpad_max_tokens = scratchpad_max_tokens
+        self.extraction_timeout = self._normalize_llm_timeout(extraction_timeout)
+        self.planning_timeout = self._normalize_llm_timeout(planning_timeout)
+        self.query_timeout = self._normalize_llm_timeout(query_timeout)
+        self.extraction_concurrency = max(1, int(extraction_concurrency or 3))
+        self.heavy_llm_timeout = self._normalize_llm_timeout(heavy_llm_timeout)
         self.min_rounds = min_rounds
         self.max_empty_rounds = max_empty_rounds
-        self.synthesis_window = synthesis_window
         self._progress = progress_callback
         self._cancelled = False
         self._start_time: float = 0
-        self.queries_used: Set[str] = set()
-        self.urls_fetched: Set[str] = set()
-        self.analyzed_urls: List[Dict[str, str]] = []
+        self._step_counter: int = 0
+        self.queries_used: set[str] = set()
+        self.urls_fetched: set[str] = set()
+        self.analyzed_urls: list[dict[str, str]] = []
         self.round_count: int = 0
-        # Track which search providers actually returned results during the
-        # run, in arrival order — surfaced in the visual report so users can
-        # see whether searxng / brave / tavily etc. carried the work.
-        self.providers_used: List[str] = []
-        self.findings: List[Dict] = []
-        self.evolving_report: str = ""
+        self.providers_used: list[str] = []
+        self.findings: list[dict] = []
+        self.scratchpad: str = ""
+        self.plan_sub_questions: list[str] = []
+        self.citation_map: list[dict] = []
         self.research_plan: str = ""
+        self.extract_ok: int = 0
+        self.extract_failed: int = 0
+        self.extract_timeout: int = 0
+        self.pages_fetched: int = 0
+        self.evidence_store = evidence_store
+        self.session_id = (session_id or "").strip()
+        self.compression_backend = (compression_backend or "heuristic").strip().lower()
+        try:
+            self.coverage_threshold = float(coverage_threshold)
+        except (TypeError, ValueError):
+            self.coverage_threshold = 0.75
+        self._pending_outbound: list[dict] = []
+        self._query_strategies: dict[str, str] = {}
+
+    @staticmethod
+    def _normalize_llm_timeout(value: int | None) -> int | None:
+        """Return seconds cap, or None when research should not cap LLM reads."""
+        if value is None:
+            return None
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return None
+        return None if n <= 0 else n
+
+    @staticmethod
+    def _is_extraction_timeout_error(exc: Exception) -> bool:
+        """True when an extraction LLM call likely failed on timeout."""
+        text = str(exc).lower()
+        if "timeout" in text or "timed out" in text:
+            return True
+        detail = getattr(exc, "detail", None)
+        if detail is not None and ("timeout" in str(detail).lower() or "timed out" in str(detail).lower()):
+            return True
+        try:
+            import httpx
+
+            if isinstance(exc, httpx.TimeoutException):
+                return True
+        except ImportError:
+            pass
+        return False
 
     def cancel(self):
         """Request cooperative cancellation of the research loop."""
@@ -261,39 +311,40 @@ class DeepResearcher:
         self,
         question: str,
         prior_report: str = "",
-        prior_findings: Optional[List[Dict]] = None,
-        prior_urls: Optional[Set[str]] = None,
+        prior_findings: list[dict] | None = None,
+        prior_urls: set[str] | None = None,
     ) -> str:
-        """Run iterative research and return a final report.
+        """Run iterative research and return the final answer.
 
         Args:
             question: The research question.
-            prior_report: Previous report to continue from (for follow-up research).
+            prior_report: Previous scratchpad to continue from (continuation API).
             prior_findings: Previous findings to build on.
             prior_urls: URLs already visited (won't be re-fetched).
         """
         self._start_time = time.time()
-        findings: List[Dict] = list(prior_findings) if prior_findings else []
-        report = prior_report or ""
+        findings: list[dict] = list(prior_findings) if prior_findings else []
+        scratchpad = prior_report or ""
+        if not scratchpad and self.session_id:
+            scratchpad = self._load_latest_scratchpad() or ""
 
-        # PLAN: Analyze the question and create a research strategy
-        if not prior_report:
-            self._emit(phase="planning")
-            self.research_plan = await self._create_plan(question)
-            logger.info(f"Research plan: {self.research_plan[:200]}")
-        else:
-            # Continuation — plan around the follow-up
-            self._emit(phase="planning")
-            self.research_plan = await self._create_plan(question)
-            logger.info(f"Continuation plan: {self.research_plan[:200]}")
-        if not self.category and not prior_report:
-            self.category = await self._classify_category(question)
-            if self.category:
-                logger.info(f"Auto-detected category: {self.category}")
+        if self.evidence_store is None:
+            try:
+                from src.evidence_store import EvidenceStore
+                self.evidence_store = EvidenceStore()
+            except Exception as exc:
+                logger.info("EvidenceStore unavailable: %s", exc)
+                self.evidence_store = None
+
+        self._emit(phase="planning")
+        self.research_plan = await self._create_plan(question)
+        logger.info(f"Research plan: {self.research_plan[:200]}")
 
         if prior_urls:
-            self.urls_fetched.update(prior_urls)
-        self.findings = findings  # expose for handler
+            for url in prior_urls:
+                key = normalize_url(url) or url
+                self.urls_fetched.add(key)
+        self.findings = findings
         consecutive_empty_rounds = 0
 
         for round_num in range(1, self.max_rounds + 1):
@@ -306,33 +357,41 @@ class DeepResearcher:
                 break
 
             logger.info(f"=== Research Round {round_num} ===")
-            self._emit(phase="searching", round=round_num, total_sources=len(self.urls_fetched))
-
-            # THINK: generate queries
-            queries = await self._generate_queries(question, report, round_num)
+            gaps = self._extract_gaps_from_scratchpad(scratchpad)
+            queries = await self._generate_queries(question, scratchpad, round_num, gaps)
             if not queries:
                 logger.warning(f"Round {round_num}: no queries generated, stopping")
                 break
 
-            self._emit(phase="searching", round=round_num, queries=len(queries),
-                       query_preview=queries[0] if queries else "",
-                       total_sources=len(self.urls_fetched))
+            self._emit(
+                phase="searching",
+                step_description=f"Searching round {round_num}",
+                round=round_num,
+                queries=queries,
+                query_preview=queries[0] if queries else "",
+                total_sources=len(self.urls_fetched),
+                total_findings=len(findings),
+            )
 
-            # SEARCH + EXTRACT
+            urls_before = len(self.urls_fetched)
             round_findings = await self._search_and_extract(queries, question)
+            sources_found = len(self.urls_fetched) - urls_before
+
             if round_findings:
                 findings.extend(round_findings)
                 consecutive_empty_rounds = 0
                 logger.info(f"Round {round_num}: extracted {len(round_findings)} findings")
-                self._emit(phase="reading", round=round_num,
-                           new_sources=len(round_findings),
-                           total_sources=len(self.urls_fetched),
-                           total_findings=len(findings))
             else:
                 consecutive_empty_rounds += 1
-                logger.info(f"Round {round_num}: no new findings ({consecutive_empty_rounds} consecutive empty)")
+                logger.info(
+                    f"Round {round_num}: no new findings "
+                    f"({consecutive_empty_rounds} consecutive empty)"
+                )
                 if consecutive_empty_rounds >= self.max_empty_rounds:
-                    logger.warning(f"Search appears to be down — {self.max_empty_rounds} consecutive rounds with no results")
+                    logger.warning(
+                        f"Search appears to be down — "
+                        f"{self.max_empty_rounds} consecutive rounds with no results"
+                    )
                     err_detail = getattr(self, '_last_search_error', 'unknown error')
                     self._emit(phase="error", message=f"Search engine unavailable: {err_detail}")
                     if not findings:
@@ -343,51 +402,63 @@ class DeepResearcher:
                         )
                     break
 
-            # SYNTHESIZE
             if findings:
-                self._emit(phase="analyzing", round=round_num,
-                           total_sources=len(self.urls_fetched),
-                           total_findings=len(findings))
-                report = await self._synthesize(question, findings, report)
+                scratchpad = await self._update_scratchpad(
+                    question, self.plan_sub_questions, scratchpad, round_findings,
+                )
+                self.scratchpad = scratchpad
+                self._persist_scratchpad(round_num, scratchpad)
+                insights = self._extract_insights_for_ui(scratchpad)
+                sources_preview = self._sources_preview_from_round(round_findings, limit=5)
+                self._emit(
+                    phase="analyzing",
+                    step_description="Updating research notes",
+                    round=round_num,
+                    insights=insights,
+                    sources_found=sources_found,
+                    sources_preview=sources_preview,
+                    sources_more=max(0, len(self.urls_fetched) - len(sources_preview)),
+                    total_sources=len(self.urls_fetched),
+                    total_findings=len(findings),
+                )
 
-            # DECIDE
             if round_num >= self.min_rounds:
-                should_stop = await self._should_stop(question, report, round_num)
-                if should_stop:
-                    logger.info(f"LLM decided to stop after round {round_num}")
+                if await self._coverage_complete(question, scratchpad, self.plan_sub_questions, round_num):
+                    logger.info(f"Coverage complete after round {round_num}")
                     break
 
-        # FINAL REPORT
-        self._emit(phase="writing", total_sources=len(self.urls_fetched),
-                   total_findings=len(findings))
-        if not report:
-            # Synthesis can fail (e.g. the LLM timed out) even though the search
-            # rounds did gather findings. Don't throw that work away — return the
-            # gathered findings as a basic compiled report instead of claiming
-            # nothing was found (#1551).
-            if findings:
-                logger.warning(
-                    "Synthesis produced no report; returning %d gathered "
-                    "finding(s) as a fallback", len(findings)
-                )
-                return self._fallback_report(question, findings)
+        self.scratchpad = scratchpad
+        self._emit(
+            phase="writing",
+            step_description="Composing final answer",
+            total_sources=len(self.urls_fetched),
+            total_findings=len(findings),
+        )
+
+        if not scratchpad and not findings:
             return "No information could be gathered for this question."
 
-        self.evolving_report = report  # preserve pre-synthesis report
-        final = await self._final_report(question, report)
+        final = await self._compose_answer(question, scratchpad, self.plan_sub_questions)
+        if not final and findings:
+            logger.warning(
+                "Compose produced no answer; returning %d gathered finding(s) as fallback",
+                len(findings),
+            )
+            return self._fallback_report(question, findings)
+
         elapsed = time.time() - self._start_time
         logger.info(
             f"Research complete: {self.round_count} rounds, "
             f"{len(findings)} findings, {len(self.urls_fetched)} URLs, "
             f"{elapsed:.1f}s"
         )
-        return final
+        return final or self._fallback_report(question, findings)
 
     # ------------------------------------------------------------------
     # LLM helper
     # ------------------------------------------------------------------
-    async def _llm(self, messages: List[Dict], temperature: float = 0.3,
-                   max_tokens: int = 4096, timeout: int = 60) -> str:
+    async def _llm(self, messages: list[dict], temperature: float = 0.3,
+                   max_tokens: int = 4096, timeout: int | None = None) -> str:
         """Call the LLM asynchronously and strip thinking tags."""
         if self._cursor_backend is not None:
             response = await self._cursor_backend.complete(
@@ -410,8 +481,8 @@ class DeepResearcher:
         )
         return strip_thinking(response)
 
-    async def _llm_extract(self, messages: List[Dict], temperature: float = 0.2,
-                           max_tokens: int = 2048, timeout: int = 60) -> str:
+    async def _llm_extract(self, messages: list[dict], temperature: float = 0.2,
+                           max_tokens: int = 2048, timeout: int | None = None) -> str:
         """Per-URL extraction LLM — HTTP endpoint when hybrid mode is configured."""
         if not self.extract_llm_endpoint or not self.extract_llm_model:
             return await self._llm(
@@ -444,11 +515,15 @@ class DeepResearcher:
                 [{"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=1024,
-                timeout=getattr(self, "planning_timeout", 90),
+                timeout=getattr(self, "planning_timeout", None),
             )
             # Try to parse as JSON for structured plan
             parsed = self._parse_json_object(response)
             if parsed:
+                if parsed.get("sub_questions"):
+                    self.plan_sub_questions = [
+                        str(q) for q in parsed["sub_questions"] if q
+                    ]
                 parts = []
                 if parsed.get("sub_questions"):
                     parts.append("Sub-questions: " + "; ".join(parsed["sub_questions"]))
@@ -463,61 +538,83 @@ class DeepResearcher:
             self._emit(phase="warning", message="Planning step failed, proceeding with direct search")
             return ""
 
-    async def _classify_category(self, question: str) -> Optional[str]:
-        """Fast LLM call to classify the research question into a category."""
-        valid = ", ".join(CATEGORY_PROMPTS.keys())
-        prompt = (
-            f"Classify this research question into exactly ONE category.\n"
-            f"Categories: {valid}\n"
-            f"If none fit well, respond with: general\n\n"
-            f"Question: {question}\n\n"
-            f"Respond with ONLY the category name, nothing else."
-        )
-        try:
-            result = await self._llm(
-                [{"role": "user", "content": prompt}],
-                temperature=0, max_tokens=20, timeout=15,
-            )
-            cat = (result or "").strip().lower()
-            # Clean one-word answer first.
-            parts = cat.split()
-            first = parts[0].strip(".,\"'*:") if parts else ""
-            if first in CATEGORY_PROMPTS:
-                return first
-            # Weak local models often wrap the label in preamble ("the category
-            # is product") — scan the whole reply for any known category word
-            # before giving up (which would default to the generic format).
-            for c in CATEGORY_PROMPTS:
-                if c in cat:
-                    return c
-            return None
-        except Exception as e:
-            logger.warning(f"Category classification failed: {e}")
-            return None
+    def _fallback_search_queries(
+        self,
+        question: str,
+        *,
+        round_num: int,
+        gaps: list[str] | None,
+        num_queries: int,
+    ) -> list[str]:
+        """Запасные поисковые запросы, если LLM не вернул разбираемый JSON."""
+        candidates: list[str] = []
+
+        for sq in self.plan_sub_questions:
+            text = str(sq).strip()
+            if text:
+                candidates.append(text)
+
+        for gap in gaps or []:
+            text = str(gap).strip()
+            if text:
+                candidates.append(text)
+
+        lines = [ln.strip() for ln in question.splitlines() if ln.strip()]
+        if lines:
+            candidates.append(lines[0][:240])
+        condensed = " ".join(question.split())
+        if condensed:
+            candidates.append(condensed[:240])
+
+        if round_num > 1 and gaps:
+            for gap in gaps[:2]:
+                text = str(gap).strip()
+                if text:
+                    candidates.append(f"{text} {condensed[:120]}".strip()[:240])
+
+        out: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            item = candidate.strip()
+            if not item or item in self.queries_used or item in seen:
+                continue
+            seen.add(item)
+            out.append(item)
+            if len(out) >= num_queries:
+                break
+        return out
 
     # ------------------------------------------------------------------
     # THINK: generate search queries
     # ------------------------------------------------------------------
-    async def _generate_queries(self, question: str, report: str,
-                                round_num: int) -> List[str]:
+    async def _generate_queries(
+        self,
+        question: str,
+        scratchpad: str,
+        round_num: int,
+        gaps: list[str] | None = None,
+    ) -> list[str]:
         if round_num == 1:
-            num_queries = 4
+            num_queries = self.queries_round1
             round_instruction = (
                 "This is the first round — generate broad, diverse queries "
                 "that explore the key facets of the question."
             )
         else:
-            num_queries = 3
+            num_queries = self.queries_followup
             round_instruction = (
-                "We already have partial findings.  Generate targeted follow-up "
+                "We already have partial findings. Generate targeted follow-up "
                 "queries to fill gaps, verify claims, or explore specific aspects "
-                "that the report doesn't yet cover well."
+                "that the scratchpad doesn't yet cover well."
             )
+
+        gaps_text = "\n".join(f"- {g}" for g in (gaps or [])) or "(none identified)"
 
         prompt = current_date_context() + QUERY_GEN_PROMPT.format(
             question=question,
             research_plan=self.research_plan or "(No plan — search broadly.)",
-            report=report or "(No findings yet.)",
+            scratchpad=scratchpad or "(No findings yet.)",
+            gaps=gaps_text,
             round_num=round_num,
             num_queries=num_queries,
             round_instruction=round_instruction,
@@ -528,10 +625,35 @@ class DeepResearcher:
                 [{"role": "user", "content": prompt}],
                 temperature=0.5,
                 max_tokens=4096,
-                timeout=getattr(self, "query_timeout", 120),
+                timeout=getattr(self, "query_timeout", None),
             )
-            queries = self._parse_json_array(response)
-            # Deduplicate
+            parsed_items = self._parse_query_items(response)
+            queries = [item["query"] for item in parsed_items if item.get("query")]
+            strategies = getattr(self, "_query_strategies", None)
+            if strategies is None:
+                self._query_strategies = {}
+                strategies = self._query_strategies
+            for item in parsed_items:
+                q = item.get("query", "")
+                if q:
+                    strategies[q] = item.get("strategy", "web")
+            if not queries:
+                logger.warning(
+                    "Round %s: LLM returned no parseable queries (preview: %r)",
+                    round_num,
+                    (response or "")[:160],
+                )
+                queries = self._fallback_search_queries(
+                    question,
+                    round_num=round_num,
+                    gaps=gaps,
+                    num_queries=num_queries,
+                )
+                if queries:
+                    self._emit(
+                        phase="warning",
+                        message="Модель не вернула JSON-запросы — используем запасной набор",
+                    )
             new_queries = [q for q in queries if q not in self.queries_used]
             self.queries_used.update(new_queries)
             logger.info(f"Round {round_num} queries: {new_queries}")
@@ -539,22 +661,34 @@ class DeepResearcher:
         except Exception as e:
             logger.error(f"Query generation failed: {e}")
             self._emit(phase="warning", message=f"Query generation failed: {e}")
-            return []
+            fallback = self._fallback_search_queries(
+                question,
+                round_num=round_num,
+                gaps=gaps,
+                num_queries=num_queries,
+            )
+            new_queries = [q for q in fallback if q not in self.queries_used]
+            self.queries_used.update(new_queries)
+            if new_queries:
+                logger.info(f"Round {round_num} fallback queries: {new_queries}")
+            return new_queries
 
     # ------------------------------------------------------------------
     # SEARCH + EXTRACT
     # ------------------------------------------------------------------
-    async def _search_and_extract(self, queries: List[str],
-                                  question: str) -> List[Dict]:
+    async def _search_and_extract(self, queries: list[str],
+                                  question: str) -> list[dict]:
         """Search each query and extract relevant info from top results."""
-        all_findings: List[Dict] = []
+        all_findings: list[dict] = []
 
         # Search all queries in parallel
         search_tasks = [self._search(q) for q in queries]
         search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
 
-        # Collect URLs to fetch from all search results
+        # Collect URLs to fetch from all search results, then rank the pool
+        # before fetch so budget goes to the most relevant pages.
         urls_to_fetch = []
+        round_url_cap = self.max_urls_per_query * len(queries)
         for result in search_results:
             if isinstance(result, Exception):
                 logger.warning(f"Search error: {result}")
@@ -563,15 +697,47 @@ class DeepResearcher:
                 continue
             for r in result:
                 url = r.get("url", "")
-                if url and url not in self.urls_fetched:
+                key = normalize_url(url) or url
+                if url and key not in self.urls_fetched:
                     urls_to_fetch.append(r)
-                    self.urls_fetched.add(url)
-                    self.analyzed_urls.append({
-                        "url": url,
-                        "title": r.get("title", "") or url,
-                    })
-                if len(urls_to_fetch) >= self.max_urls_per_round * len(queries):
-                    break
+
+        if urls_to_fetch:
+            try:
+                from services.search.ranking import rank_search_results
+                urls_to_fetch = rank_search_results(question, urls_to_fetch)
+            except Exception as exc:
+                logger.warning("Research ranking failed, using provider order: %s", exc)
+
+        selected: list[dict] = []
+        for r in urls_to_fetch:
+            if len(selected) >= round_url_cap:
+                break
+            url = r.get("url", "")
+            key = normalize_url(url) or url
+            if not url or key in self.urls_fetched:
+                continue
+            self.urls_fetched.add(key)
+            self.analyzed_urls.append({
+                "url": url,
+                "title": r.get("title", "") or url,
+            })
+            selected.append(r)
+
+        # Optional outbound 1-hop follow-ups queued from previous extracts.
+        for pending in list(self._pending_outbound):
+            if len(selected) >= round_url_cap:
+                break
+            url = pending.get("url", "")
+            key = normalize_url(url) or url
+            if not url or key in self.urls_fetched:
+                continue
+            self.urls_fetched.add(key)
+            self.analyzed_urls.append({
+                "url": url,
+                "title": pending.get("title", "") or url,
+            })
+            selected.append(pending)
+        self._pending_outbound = []
 
         if self._cancelled or self._time_exceeded():
             return all_findings
@@ -581,11 +747,11 @@ class DeepResearcher:
         # slower and can trip the extraction timeout.
         semaphore = asyncio.Semaphore(self.extraction_concurrency)
 
-        async def _bounded_extract(result: Dict) -> Optional[Dict]:
+        async def _bounded_extract(result: dict) -> dict | None:
             async with semaphore:
                 return await self._fetch_and_extract(result["url"], question, result.get("title", ""))
 
-        extract_tasks = [_bounded_extract(r) for r in urls_to_fetch]
+        extract_tasks = [_bounded_extract(r) for r in selected]
         results_gathered = await asyncio.gather(*extract_tasks, return_exceptions=True)
 
         for result in results_gathered:
@@ -597,9 +763,24 @@ class DeepResearcher:
 
         return all_findings
 
-    async def _search(self, query: str) -> List[Dict]:
+    async def _search(self, query: str) -> list[dict]:
         """Run a search query using the configured research search provider."""
         try:
+            strategies = getattr(self, "_query_strategies", None) or {}
+            strategy = strategies.get(query, "web")
+            if strategy in {"academic", "github", "pdf"}:
+                try:
+                    from services.search.academic import search_academic
+                    academic_hits = await asyncio.to_thread(
+                        search_academic, query, strategy, 10,
+                    )
+                    if academic_hits:
+                        if strategy not in self.providers_used:
+                            self.providers_used.append(strategy)
+                        return academic_hits
+                except Exception as exc:
+                    logger.warning("Academic search (%s) failed: %s", strategy, exc)
+
             from src.search.providers import _get_search_settings
             from src.search.core import _call_provider, _build_provider_chain
 
@@ -621,6 +802,11 @@ class DeepResearcher:
                 try:
                     results = await asyncio.to_thread(_call_provider, prov, query, 10)
                     if results:
+                        try:
+                            from services.search.ranking import rank_search_results
+                            results = rank_search_results(query, results)
+                        except Exception as rank_exc:
+                            logger.debug("Per-query ranking skipped: %s", rank_exc)
                         logger.info(f"Research search: {prov} returned {len(results)} results")
                         if prov not in self.providers_used:
                             self.providers_used.append(prov)
@@ -647,7 +833,7 @@ class DeepResearcher:
             return []
 
     async def _fetch_and_extract(self, url: str, question: str,
-                                 title: str) -> Optional[Dict]:
+                                 title: str) -> dict | None:
         """Fetch a URL's content and use LLM to extract relevant info."""
         display = title or url
         self._emit(phase="reading", url=url, title=display,
@@ -662,21 +848,61 @@ class DeepResearcher:
         if not page.get("success") or not page.get("content"):
             return None
 
+        self.pages_fetched += 1
         content = page["content"]
-        # Truncate to avoid blowing up context, preferring paragraph boundary
-        if len(content) > self.max_content_chars:
-            truncated = content[:self.max_content_chars]
-            last_para = truncated.rfind('\n\n')
-            if last_para > self.max_content_chars * 0.8:
-                content = truncated[:last_para]
+        result = await self._extract_page_content(
+            url,
+            question,
+            title,
+            page,
+            content,
+            allow_retry=True,
+        )
+        if result is not None:
+            self.extract_ok += 1
+            self._index_finding_evidence(url, content, result)
+            self._maybe_queue_outbound_links(url, question, content, result)
+        return result
+
+    async def _extract_page_content(
+        self,
+        url: str,
+        question: str,
+        title: str,
+        page: dict,
+        content: str,
+        *,
+        allow_retry: bool,
+    ) -> dict | None:
+        """Run LLM extraction on fetched page text."""
+        max_chars = self.max_content_chars
+        prepared = content
+        if self.compression_backend != "off":
+            try:
+                from services.search.compression import compress_content
+                prepared = compress_content(
+                    content,
+                    question,
+                    backend=self.compression_backend,
+                    max_chars=max_chars,
+                )
+            except Exception as exc:
+                logger.warning("Compression failed for %s: %s", url, exc)
+                prepared = content
+
+        if len(prepared) > max_chars:
+            truncated = prepared[:max_chars]
+            last_para = truncated.rfind("\n\n")
+            if last_para > max_chars * 0.8:
+                prepared = truncated[:last_para]
             else:
-                content = truncated
+                prepared = truncated
 
         try:
             response = await self._llm_extract(
                 [
                     {"role": "user", "content": EXTRACTOR_SYSTEM.format(goal=question)},
-                    untrusted_context_message("webpage", content),
+                    untrusted_context_message("webpage", prepared),
                 ],
                 temperature=0.2,
                 max_tokens=2048,
@@ -687,12 +913,10 @@ class DeepResearcher:
                 parsed["url"] = url
                 parsed["title"] = title or page.get("title", "")
                 parsed["og_image"] = page.get("og_image", "")
-                # Skip findings where the LLM says the page is useless
                 if is_low_quality(parsed.get("summary", "")):
                     logger.info(f"Skipping low-quality extraction from {url}")
                     return None
                 return parsed
-            # If JSON parsing fails, treat entire response as evidence
             return {
                 "url": url,
                 "title": title or page.get("title", ""),
@@ -702,52 +926,105 @@ class DeepResearcher:
                 "summary": response[:500],
             }
         except Exception as e:
+            if self._is_extraction_timeout_error(e):
+                self.extract_timeout += 1
+                if allow_retry and len(prepared) > 8000:
+                    logger.info(
+                        "Retrying extraction for %s with reduced content after timeout",
+                        url,
+                    )
+                    retry = await self._extract_page_content(
+                        url,
+                        question,
+                        title,
+                        page,
+                        prepared[:8000],
+                        allow_retry=False,
+                    )
+                    if retry is not None:
+                        return retry
+            self.extract_failed += 1
             logger.warning(f"LLM extraction failed for {url}: {e}")
             return None
 
     # ------------------------------------------------------------------
-    # SYNTHESIZE
+    # SCRATCHPAD + COMPOSE
     # ------------------------------------------------------------------
-    async def _synthesize(self, question: str, findings: List[Dict],
-                          current_report: str) -> str:
-        """LLM synthesizes all findings into an updated report."""
-        # Format findings for the prompt
-        window = findings[-self.synthesis_window:]
-        if len(findings) > self.synthesis_window:
-            logger.info(f"Synthesis using last {self.synthesis_window} of {len(findings)} findings")
-        findings_text = self._format_findings(window)
+    async def _update_scratchpad(
+        self,
+        question: str,
+        sub_questions: list[str],
+        scratchpad: str,
+        round_findings: list[dict],
+    ) -> str:
+        """LLM updates structured scratchpad from new round findings."""
+        new_findings_text = self._format_findings_for_scratchpad(round_findings)
+        sub_q_text = "\n".join(f"- {q}" for q in sub_questions) or "(from research plan)"
 
-        prompt = SYNTHESIZE_PROMPT.format(
+        prompt = SCRATCHPAD_UPDATE_PROMPT.format(
             question=question,
-            report=current_report or "(First round — no report yet.)",
-            new_findings=findings_text,
+            sub_questions=sub_q_text,
+            scratchpad=scratchpad or "(empty — first round)",
+            new_findings=new_findings_text,
         )
 
         try:
-            return await self._llm(
+            # Default 180s when attribute missing (bare __new__ in tests / legacy).
+            # Explicit None means unlimited (research_handler sets this for local LLMs).
+            heavy_timeout = getattr(self, "heavy_llm_timeout", 180)
+            response = await self._llm(
                 [{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=self.max_report_tokens,
-                # Synthesis is a heavy generation call like the final report
-                # (which gets 180s); a slow local model (e.g. a 20B served from
-                # LM Studio) routinely needs >60s for it. The old 60s cap timed
-                # out mid-stream and discarded the round's findings (#1551).
-                timeout=180,
+                temperature=0.2,
+                max_tokens=getattr(self, "scratchpad_max_tokens", 4096),
+                timeout=heavy_timeout,
             )
+            parsed = self._parse_json_object(response)
+            if parsed:
+                validated = validate_scratchpad(parsed)
+                if validated is not None:
+                    return validated.model_dump_json(indent=2)
+                logger.info("Scratchpad failed schema validation; keeping raw JSON")
+                return json.dumps(parsed, ensure_ascii=False, indent=2)
+            return response.strip() or scratchpad
         except Exception as e:
-            logger.error(f"Synthesis failed: {e}")
-            self._emit(phase="warning", message="Synthesis failed, keeping previous report")
-            return current_report  # keep the old report on failure
+            logger.error(f"Scratchpad update failed: {e}")
+            self._emit(phase="warning", message="Scratchpad update failed, keeping previous notes")
+            return scratchpad
 
-    # ------------------------------------------------------------------
-    # DECIDE
-    # ------------------------------------------------------------------
-    async def _should_stop(self, question: str, report: str,
-                           round_num: int) -> bool:
-        """Let the LLM decide whether the report is comprehensive enough."""
-        prompt = STOP_PROMPT.format(
+    async def _coverage_complete(
+        self,
+        question: str,
+        scratchpad: str,
+        sub_questions: list[str],
+        round_num: int,
+    ) -> bool:
+        """Decide if research coverage is sufficient to compose the final answer."""
+        if self._scratchpad_coverage_ok(scratchpad):
+            return True
+
+        if (
+            self.evidence_store is not None
+            and self.coverage_threshold > 0
+            and sub_questions
+        ):
+            try:
+                score = self.evidence_store.coverage_score(sub_questions)
+                logger.info(
+                    "Embedding coverage score (round %s): %.3f (threshold=%.3f)",
+                    round_num,
+                    score,
+                    self.coverage_threshold,
+                )
+                if score >= self.coverage_threshold:
+                    return True
+            except Exception as exc:
+                logger.debug("Embedding coverage check failed: %s", exc)
+
+        sub_q_text = "\n".join(f"- {q}" for q in sub_questions) or "(none)"
+        prompt = COVERAGE_STOP_PROMPT.format(
             question=question,
-            report=report,
+            sub_questions=sub_q_text,
+            scratchpad=scratchpad or "(empty)",
             round_num=round_num,
             max_rounds=self.max_rounds,
         )
@@ -758,82 +1035,166 @@ class DeepResearcher:
                 temperature=0.1,
                 max_tokens=128,
             )
-            # Reasoning models prepend a <think>...</think> block — strip it
-            # before checking for YES/NO, otherwise the answer always looks
-            # like it starts with "<THINK>" and the engine never stops.
             clean = strip_thinking(response).strip()
-            # Tolerate "**YES**", "Yes.", quotes, etc.
             answer = re.sub(r'^[\s*_`"\'>#\-]+', '', clean).upper()
             should_stop = answer.startswith("YES")
-            logger.info(f"Stop decision (round {round_num}): {clean[:120]}")
+            logger.info(f"Coverage decision (round {round_num}): {clean[:120]}")
             return should_stop
         except Exception as e:
-            logger.warning(f"Stop decision failed: {e}")
-            return False  # continue on error
+            logger.warning(f"Coverage decision failed: {e}")
+            return False
 
-    # ------------------------------------------------------------------
-    # FINAL REPORT
-    # ------------------------------------------------------------------
-    async def _final_report(self, question: str, report: str) -> str:
-        """LLM writes a polished final report, retrying if too short."""
-        prompt = FINAL_REPORT_PROMPT.format(
+    async def _compose_answer(
+        self,
+        question: str,
+        scratchpad: str,
+        sub_questions: list[str],
+    ) -> str:
+        """LLM writes the final user-facing answer from scratchpad + citations."""
+        citation_index, self.citation_map = self._build_citation_index()
+
+        prompt = FINAL_ANSWER_PROMPT.format(
             question=question,
-            report=report,
+            scratchpad=scratchpad or "(no structured notes)",
+            citation_index=citation_index,
         )
-        cat_extra = CATEGORY_PROMPTS.get(self.category or "", "")
-        if cat_extra:
-            prompt += "\n\n" + cat_extra
 
         try:
-            result = await self._llm(
+            return await self._llm(
                 [{"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=self.max_report_tokens,
-                timeout=180,
+                max_tokens=getattr(self, "max_report_tokens", 8192),
+                timeout=getattr(self, "heavy_llm_timeout", 180),
             )
-
-            # If report is too short, ask the LLM to expand it
-            if len(result.split()) < 400:
-                logger.info(f"Final report too short ({len(result.split())} words), requesting expansion")
-                self._emit(phase="writing", message="Expanding report...")
-                expanded = await self._llm(
-                    [
-                        {"role": "user", "content": prompt},
-                        {"role": "assistant", "content": result},
-                        {"role": "user", "content":
-                            "This report is too brief. Please expand it significantly:\n"
-                            "- Add detailed paragraphs for each section (not just bullet points)\n"
-                            "- Include specific data, numbers, and comparisons from the evidence\n"
-                            "- Explain context and significance — don't just list facts\n"
-                            "- Use ## headings and ### subheadings\n"
-                            "- Target at least 1000 words\n"
-                            "Write the full expanded report now."
-                        },
-                    ],
-                    temperature=0.4,
-                    max_tokens=self.max_report_tokens,
-                    timeout=180,
-                )
-                if len(expanded.split()) > len(result.split()):
-                    return expanded
-
-            return result
         except Exception as e:
-            logger.error(f"Final report generation failed: {e}")
-            return report  # return the evolving report as-is
+            logger.error(f"Final answer composition failed: {e}")
+            return ""
+
+    def _build_citation_index(self) -> tuple[str, list[dict]]:
+        """Build [^N] citation index from unique URLs in findings."""
+        seen: set[str] = set()
+        citation_map: list[dict] = []
+        lines: list[str] = []
+
+        for finding in self.findings:
+            if not isinstance(finding, dict):
+                continue
+            url = (finding.get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            cid = len(citation_map) + 1
+            title = finding.get("title", "") or url
+            citation_map.append({"id": cid, "url": url, "title": title})
+            lines.append(f"[^{cid}] {url} — {title}")
+
+        return ("\n".join(lines) if lines else "(no sources)"), citation_map
+
+    def _extract_insights_for_ui(self, scratchpad: str) -> list[str]:
+        """Extract insights bullets from scratchpad JSON for progress UI."""
+        parsed = self._parse_json_object(scratchpad)
+        if not parsed:
+            return []
+        insights = parsed.get("insights") or []
+        return [str(i) for i in insights if i][:4]
+
+    def _extract_gaps_from_scratchpad(self, scratchpad: str) -> list[str]:
+        """Collect gap strings from scratchpad sub_topics."""
+        parsed = self._parse_json_object(scratchpad)
+        if not parsed:
+            return []
+        gaps: list[str] = []
+        for topic in parsed.get("sub_topics") or []:
+            if not isinstance(topic, dict):
+                continue
+            for gap in topic.get("gaps") or []:
+                if gap:
+                    gaps.append(str(gap))
+        return gaps
+
+    def _scratchpad_coverage_ok(self, scratchpad: str) -> bool:
+        """Heuristic: all sub_topics covered or partial with ≥2 URLs in key_facts."""
+        parsed = self._parse_json_object(scratchpad)
+        if not parsed:
+            return False
+        sub_topics = parsed.get("sub_topics") or []
+        if not sub_topics:
+            return False
+
+        url_pattern = re.compile(r"https?://[^\s\]\)\"']+")
+
+        for topic in sub_topics:
+            if not isinstance(topic, dict):
+                return False
+            status = (topic.get("status") or "").lower()
+            if status == "missing":
+                return False
+            if status == "partial":
+                facts = topic.get("key_facts") or []
+                urls = set()
+                for fact in facts:
+                    urls.update(url_pattern.findall(str(fact)))
+                if len(urls) < 2:
+                    return False
+        return True
+
+    @staticmethod
+    def _sources_preview_from_round(
+        round_findings: list[dict],
+        limit: int = 5,
+    ) -> list[dict[str, str]]:
+        """Build domain preview list for progress events."""
+        preview: list[dict[str, str]] = []
+        seen_domains: set[str] = set()
+        for f in round_findings:
+            url = (f.get("url") or "").strip()
+            if not url:
+                continue
+            try:
+                domain = urlparse(url).netloc or url
+            except Exception:
+                domain = url
+            if domain in seen_domains:
+                continue
+            seen_domains.add(domain)
+            preview.append({"domain": domain, "url": url})
+            if len(preview) >= limit:
+                break
+        return preview
+
+    def _format_findings_for_scratchpad(self, findings: list[dict]) -> str:
+        """Format findings as summary + url only (no full evidence)."""
+        parts = []
+        for i, f in enumerate(findings, 1):
+            url = f.get("url", "unknown")
+            title = f.get("title", "")
+            summary = f.get("summary", "") or (f.get("evidence", "")[:500] if f.get("evidence") else "")
+            parts.append(f"**{i}** [{title}]({url})\n{summary}")
+        return "\n\n".join(parts) if parts else "(no new findings)"
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     def _emit(self, **kwargs):
         """Send a progress event via the callback, if one is registered."""
-        if self._progress:
+        step = getattr(self, "_step_counter", 0) + 1
+        self._step_counter = step
+        kwargs.setdefault("step", step)
+        # Backward compat: queries as count if list passed
+        if isinstance(kwargs.get("queries"), list):
+            qlist = kwargs["queries"]
+            kwargs["queries"] = qlist
+            kwargs.setdefault("query_preview", qlist[0] if qlist else "")
+        progress = getattr(self, "_progress", None)
+        if progress:
             try:
-                self._progress(kwargs)
+                progress(kwargs)
             except Exception:
                 pass
 
     def _time_exceeded(self) -> bool:
+        if self.max_time <= 0:
+            return False
         return (time.time() - self._start_time) > self.max_time
 
     # _strip_think_tags removed — use research_utils.strip_thinking()
@@ -847,13 +1208,42 @@ class DeepResearcher:
             text = re.sub(r'\s*```$', '', text)
         return text.strip()
 
-    def _parse_json_array(self, text: str) -> List[str]:
+    def _parse_json_array(self, text: str) -> list[str]:
         """Extract a JSON array of strings from LLM output."""
+        items = self._parse_query_items(text)
+        return [item["query"] for item in items if item.get("query")]
+
+    def _parse_query_items(self, text: str) -> list[dict[str, str]]:
+        """Parse query list as strings or {query, strategy} objects."""
         text = self._strip_code_block(text)
+        allowed = {"web", "academic", "github", "news", "pdf"}
+
+        def _normalize_item(item: object) -> dict[str, str] | None:
+            if isinstance(item, str):
+                query = item.strip()
+                if not query:
+                    return None
+                return {"query": query, "strategy": self._infer_strategy(query)}
+            if isinstance(item, dict):
+                query = str(item.get("query") or item.get("q") or "").strip()
+                if not query:
+                    return None
+                strategy = str(item.get("strategy") or item.get("type") or "").strip().lower()
+                if strategy not in allowed:
+                    strategy = self._infer_strategy(query)
+                return {"query": query, "strategy": strategy}
+            return None
+
         try:
             parsed = json.loads(text)
             if isinstance(parsed, list):
-                return [str(item) for item in parsed]
+                out = []
+                for item in parsed:
+                    normalized = _normalize_item(item)
+                    if normalized:
+                        out.append(normalized)
+                if out:
+                    return out
         except json.JSONDecodeError:
             pass
 
@@ -866,7 +1256,11 @@ class DeepResearcher:
             complete_items = re.findall(r'"([^"]*)"', text[last_start:])
             if complete_items:
                 logger.info(f"Repaired truncated JSON array: recovered {len(complete_items)} items")
-                return complete_items
+                return [
+                    {"query": item, "strategy": self._infer_strategy(item)}
+                    for item in complete_items
+                    if item.strip()
+                ]
 
         # Greedy match to capture the full outermost array
         match = re.search(r'\[[\s\S]*\]', text)
@@ -874,7 +1268,13 @@ class DeepResearcher:
             try:
                 parsed = json.loads(match.group())
                 if isinstance(parsed, list):
-                    return [str(item) for item in parsed]
+                    out = []
+                    for item in parsed:
+                        normalized = _normalize_item(item)
+                        if normalized:
+                            out.append(normalized)
+                    if out:
+                        return out
             except json.JSONDecodeError:
                 pass
 
@@ -891,7 +1291,13 @@ class DeepResearcher:
             except json.JSONDecodeError:
                 continue
         if last_parsed is not None:
-            return [str(item) for item in last_parsed]
+            out = []
+            for item in last_parsed:
+                normalized = _normalize_item(item)
+                if normalized:
+                    out.append(normalized)
+            if out:
+                return out
 
         # Last resort: harvest quoted strings from the first array start
         arr_start = text.find('[')
@@ -901,12 +1307,136 @@ class DeepResearcher:
             complete_items = re.findall(r'"([^"]*)"', fragment)
             if complete_items:
                 logger.info(f"Repaired truncated JSON array: recovered {len(complete_items)} items")
-                return complete_items
+                return [
+                    {"query": item, "strategy": self._infer_strategy(item)}
+                    for item in complete_items
+                    if item.strip()
+                ]
 
         logger.warning(f"Could not parse JSON array from: {text[:200]}")
         return []
 
-    def _parse_json_object(self, text: str) -> Optional[Dict]:
+    @staticmethod
+    def _infer_strategy(query: str) -> str:
+        """Infer search strategy from query operators when tag is missing."""
+        q = (query or "").lower()
+        if "site:arxiv.org" in q or "site:semanticscholar.org" in q:
+            return "academic"
+        if "site:github.com" in q:
+            return "github"
+        if "filetype:pdf" in q:
+            return "pdf"
+        if "after:" in q or "before:" in q:
+            return "news"
+        return "web"
+
+    def _session_state_dir(self) -> Path | None:
+        """Directory for per-round scratchpad serde, if session_id is set."""
+        if not self.session_id:
+            return None
+        from src.constants import DEEP_RESEARCH_DIR
+        path = Path(DEEP_RESEARCH_DIR) / self.session_id
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            logger.warning("Cannot create research state dir %s: %s", path, exc)
+            return None
+        return path
+
+    def _persist_scratchpad(self, round_num: int, scratchpad: str) -> None:
+        """Write scratchpad_rN.json for rollback / partial recovery."""
+        state_dir = self._session_state_dir()
+        if state_dir is None or not scratchpad:
+            return
+        path = state_dir / f"scratchpad_r{round_num}.json"
+        try:
+            path.write_text(scratchpad, encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Failed to persist scratchpad %s: %s", path, exc)
+
+    def _load_latest_scratchpad(self) -> str:
+        """Load the newest scratchpad_rN.json for this session, if any."""
+        state_dir = self._session_state_dir()
+        if state_dir is None:
+            return ""
+        files = sorted(state_dir.glob("scratchpad_r*.json"))
+        if not files:
+            return ""
+        try:
+            return files[-1].read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Failed to load scratchpad from %s: %s", files[-1], exc)
+            return ""
+
+    def _index_finding_evidence(self, url: str, content: str, finding: dict) -> None:
+        """Chunk page content and add it to the evidence store."""
+        if self.evidence_store is None:
+            return
+        try:
+            from src.chunking import chunk_text
+            chunks = chunk_text(content or finding.get("evidence", "") or finding.get("summary", ""))
+            if not chunks:
+                summary = finding.get("summary") or finding.get("evidence") or ""
+                if summary:
+                    chunks = [summary]
+            if chunks:
+                self.evidence_store.add_finding(
+                    url=url,
+                    chunks=chunks,
+                    title=finding.get("title", ""),
+                )
+        except Exception as exc:
+            logger.debug("Evidence indexing skipped for %s: %s", url, exc)
+
+    def _maybe_queue_outbound_links(
+        self,
+        url: str,
+        question: str,
+        content: str,
+        finding: dict,
+    ) -> None:
+        """Queue up to 3 outbound links from index/list pages for the next round."""
+        rational = str(finding.get("rational") or "").lower()
+        looks_like_index = any(
+            token in rational
+            for token in ("index", "list page", "table of contents", "toc", "directory")
+        )
+        hrefs = re.findall(r"https?://[^\s\)\]\"'<>]+", content or "")
+        if not looks_like_index and len(hrefs) < 8:
+            return
+        candidates: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for href in hrefs:
+            key = normalize_url(href) or href
+            if not key or key in self.urls_fetched or key in seen:
+                continue
+            if key == (normalize_url(url) or url):
+                continue
+            seen.add(key)
+            candidates.append({"url": href, "title": href})
+            if len(candidates) >= 12:
+                break
+        if not candidates:
+            return
+
+        ranked = candidates
+        if self.evidence_store is not None and hasattr(self.evidence_store, "rank_texts"):
+            try:
+                ranked = self.evidence_store.rank_texts(
+                    question,
+                    [c["url"] for c in candidates],
+                    top_k=3,
+                )
+                ranked = [{"url": item, "title": item} for item in ranked]
+            except Exception:
+                ranked = candidates[:3]
+        else:
+            ranked = candidates[:3]
+
+        for item in ranked[:3]:
+            self._pending_outbound.append(item)
+
+    def _parse_json_object(self, text: str) -> dict | None:
         """Extract a JSON object from LLM output."""
         text = self._strip_code_block(text)
         try:
@@ -924,7 +1454,7 @@ class DeepResearcher:
 
         return None
 
-    def _format_findings(self, findings: List[Dict]) -> str:
+    def _format_findings(self, findings: list[dict]) -> str:
         """Format findings list into readable text for synthesis prompt."""
         parts = []
         for i, f in enumerate(findings, 1):
@@ -937,22 +1467,20 @@ class DeepResearcher:
             parts.append(f"**Finding {i}** — [{title}]({url})\n{content}")
         return "\n\n".join(parts)
 
-    def _fallback_report(self, question: str, findings: List[Dict]) -> str:
+    def _fallback_report(self, question: str, findings: list[dict]) -> str:
         """Compile gathered findings into a basic report.
 
-        Used when the LLM synthesis step produced no report (e.g. it timed out)
-        but the search rounds did collect findings — so the user still gets the
-        material that was gathered instead of "No information could be gathered"
+        Used when compose did not complete but search rounds collected findings
         (#1551).
         """
         return (
             f"# {question}\n\n"
-            "_Automatic synthesis did not complete, so this report lists the "
+            "_Automatic composition did not complete, so this answer lists the "
             f"{len(findings)} finding(s) gathered during research._\n\n"
             f"{self._format_findings(findings)}"
         )
 
-    def get_stats(self) -> Dict:
+    def get_stats(self) -> dict:
         """Return research statistics."""
         elapsed = time.time() - self._start_time if self._start_time else 0
         stats = {
@@ -960,10 +1488,13 @@ class DeepResearcher:
             "Rounds": self.round_count,
             "Queries": len(self.queries_used),
             "URLs": len(self.urls_fetched),
+            "Extracted": self.extract_ok,
+            "ExtractFailed": self.extract_failed,
+            "ExtractTimeouts": self.extract_timeout,
             "Model": self.llm_model,
         }
         if self.providers_used:
             stats["Search"] = ", ".join(self.providers_used)
-        if self.category:
-            stats["Category"] = self.category.capitalize()
+        if self.extract_ok == 0 and len(self.urls_fetched) > 0:
+            stats["FailureReason"] = "llm_extraction"
         return stats
