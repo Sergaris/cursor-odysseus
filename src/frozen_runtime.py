@@ -73,3 +73,7 @@ def configure_frozen_runtime() -> None:
 
     configure_windows_subprocess_runtime()
     ensure_default_workspace_dir()
+
+    from src.bundled_searxng import schedule_bundled_searxng_background
+
+    schedule_bundled_searxng_background()

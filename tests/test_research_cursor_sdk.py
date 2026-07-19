@@ -8,12 +8,7 @@ from src.research_handler import ResearchHandler, _is_cursor_research_brain
 
 
 @pytest.mark.asyncio
-async def test_call_research_service_cursor_probe_and_cleanup(monkeypatch):
-    monkeypatch.setattr(
-        "src.research_handler._is_cursor_research_brain",
-        lambda: True,
-    )
-
+async def test_call_research_service_cursor_cleanup(monkeypatch):
     mock_backend = MagicMock()
     mock_backend.probe = AsyncMock()
     mock_backend.close = MagicMock()
@@ -32,13 +27,13 @@ async def test_call_research_service_cursor_probe_and_cleanup(monkeypatch):
         entry = {}
         result = await handler.call_research_service(
             query="test query",
-            llm_endpoint="http://ignored",
-            llm_model="ignored",
+            llm_endpoint="cursor-sdk://local",
+            llm_model="composer-2.5",
             _task_entry=entry,
             session_id="rp-test123",
         )
 
-    mock_backend.probe.assert_awaited_once()
+    mock_backend.probe.assert_not_called()
     mock_backend.close.assert_called_once()
     assert entry.get("cursor_backend") is mock_backend
     assert "report body" in result

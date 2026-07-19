@@ -9,8 +9,9 @@ Goal: {goal}
 
 Task guidelines:
 1. Locate the specific sections directly related to the goal within the provided webpage content.
-2. Identify and extract the most relevant information; output full original context where possible, up to three or more paragraphs.
-3. Organize into a concise paragraph with logical flow, judging each piece of information's contribution to the goal.
+2. "evidence": full quotes/context (up to 3 paragraphs) — stored in findings archive.
+3. "summary": max 3 sentences — used for scratchpad and insights ONLY.
+4. Organize evidence with logical flow, judging each piece's contribution to the goal.
 
 Respond in JSON with exactly these fields: "rational", "evidence", "summary".
 

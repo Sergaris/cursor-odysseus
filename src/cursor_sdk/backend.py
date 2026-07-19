@@ -213,12 +213,12 @@ class CursorSDKBackend:
         *,
         temperature: float = 0.3,  # noqa: ARG002
         max_tokens: int = 4096,  # noqa: ARG002
-        timeout: int = 60,
+        timeout: int | None = 60,
     ) -> str:
         """Выполняет completion через Cursor SDK."""
         prompt = messages_to_prompt(messages, text_only=True)
 
-        try:
+        async def _await_run() -> str:
             if self.scope == "ephemeral" or self._registry is None:
                 async def _run() -> str:
                     return await _complete_ephemeral(
@@ -241,12 +241,17 @@ class CursorSDKBackend:
 
             for attempt in range(2):
                 try:
-                    return await asyncio.wait_for(_run(), timeout=timeout)
+                    return await _run()
                 except Exception as exc:
                     action = await retry_after_bridge_transport_error(self.cwd, exc)
                     if attempt == 0 and action != "no":
                         continue
                     raise
+
+        try:
+            if timeout is None or timeout <= 0:
+                return await _await_run()
+            return await asyncio.wait_for(_await_run(), timeout=timeout)
         except CursorSDKAuthError as exc:
             raise CursorSDKError(str(exc)) from exc
 

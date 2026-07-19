@@ -391,13 +391,13 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
 
     class ResearchStartRequest(BaseModel):
         query: str
-        # max_rounds=0 means "Auto" — let the AI decide when to stop, capped at 20.
+        # max_rounds=0 means "Auto" — let the AI decide when to stop, capped at 10.
         max_rounds: int = Field(default=0, ge=0, le=20)
         search_provider: Optional[str] = None
         endpoint_id: Optional[str] = None
         model: Optional[str] = None
-        max_time: int = Field(default=300, ge=60, le=1800)
-        extraction_timeout: Optional[int] = Field(default=None, ge=15, le=3600)
+        max_time: int | None = Field(default=None, ge=0)
+        extraction_timeout: Optional[int] = Field(default=None, ge=0)
         extraction_concurrency: Optional[int] = Field(default=None, ge=1, le=12)
         category: Optional[str] = None
 
@@ -423,14 +423,7 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
         session_id = f"rp-{uuid.uuid4().hex[:12]}"
 
         from src.settings import get_setting
-        if get_setting("research_brain_provider", "http") == "cursor_sdk":
-            from src.cursor_sdk.provider import CURSOR_SDK_BASE_URL
-            ep_url = CURSOR_SDK_BASE_URL
-            ep_model = (get_setting("research_brain_model", "composer-2.5") or "composer-2.5").strip()
-            if body.model:
-                ep_model = body.model
-            ep_headers = {}
-        elif body.endpoint_id:
+        if body.endpoint_id:
             from src.database import SessionLocal
             db = SessionLocal()
             try:
@@ -446,6 +439,13 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
                 ep_url, ep_model, ep_headers = resolved
             finally:
                 db.close()
+        elif get_setting("research_brain_provider", "http") == "cursor_sdk":
+            from src.cursor_sdk.provider import CURSOR_SDK_BASE_URL
+            ep_url = CURSOR_SDK_BASE_URL
+            ep_model = (get_setting("research_brain_model", "composer-2.5") or "composer-2.5").strip()
+            if body.model:
+                ep_model = body.model
+            ep_headers = {}
         else:
             ep_url, ep_model, ep_headers = resolve_endpoint("research", owner=user)
             if not ep_url:
@@ -478,18 +478,26 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
             if body.model:
                 ep_model = body.model
 
-        # max_rounds=0 → "Auto", let AI decide; pass 20 as the safety cap.
-        effective_max_rounds = body.max_rounds if body.max_rounds > 0 else 20
+        # max_rounds=0 → "Auto", let AI decide; pass 10 as the safety cap.
+        effective_max_rounds = body.max_rounds if body.max_rounds > 0 else 10
+        from src.settings import get_setting
+        if body.max_time is not None:
+            effective_max_time = max(0, int(body.max_time))
+        else:
+            try:
+                effective_max_time = int(get_setting("research_max_time_seconds", 0))
+            except (TypeError, ValueError):
+                effective_max_time = 0
+            effective_max_time = max(0, effective_max_time)
         research_handler.start_research(
             session_id=session_id,
             query=body.query,
             llm_endpoint=ep_url,
             llm_model=ep_model,
-            max_time=body.max_time,
+            max_time=effective_max_time,
             llm_headers=ep_headers,
             max_rounds=effective_max_rounds,
             search_provider=body.search_provider or None,
-            category=body.category or None,
             extraction_timeout=body.extraction_timeout,
             extraction_concurrency=body.extraction_concurrency,
             owner=user,
@@ -547,11 +555,22 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
                     "sources": d.get("sources", []),
                     "raw_findings": d.get("raw_findings", []),
                     "category": d.get("category") or "",
+                    "stats": d.get("stats") or {},
+                    "failure_reason": d.get("failure_reason") or (d.get("stats") or {}).get("FailureReason", ""),
                 }
             raise HTTPException(404, "No research result available")
         sources = research_handler.get_sources(session_id) or []
         raw_findings = research_handler.get_raw_findings(session_id) or []
-        return {"result": result, "sources": sources, "raw_findings": raw_findings, "category": ""}
+        entry = research_handler._active_tasks.get(session_id) or {}
+        stats = entry.get("stats") or {}
+        return {
+            "result": result,
+            "sources": sources,
+            "raw_findings": raw_findings,
+            "category": "",
+            "stats": stats,
+            "failure_reason": stats.get("FailureReason", ""),
+        }
 
     @router.post("/api/research/spinoff/{session_id}")
     async def research_spinoff(session_id: str, request: Request):

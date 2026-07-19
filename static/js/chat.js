@@ -74,6 +74,64 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     }
     if (tsSpan) roleEl.appendChild(tsSpan);
   }
+
+  /** Останавливает анимации на карточке tool в agent-thread. */
+  function _stopToolNodeTickers(node) {
+    if (!node) return;
+    if (node._waveInterval) { clearInterval(node._waveInterval); node._waveInterval = null; }
+    if (node._elapsedTicker) { clearInterval(node._elapsedTicker); node._elapsedTicker = null; }
+  }
+
+  /**
+   * Находит running-карточку tool по tool+command (не только currentToolBubble).
+   * Нужно при параллельных web_fetch: один указатель перезаписывается и
+   * tool_output попадает не в тот узел — таймер крутится вечно.
+   */
+  function _resolveToolBubble(json, fallback) {
+    const tool = (json.tool || '').toLowerCase();
+    const cmd = (json.command || '').trim();
+    const threads = document.querySelectorAll('.agent-thread');
+    for (let ti = threads.length - 1; ti >= 0; ti--) {
+      const running = threads[ti].querySelectorAll('.agent-thread-node.running');
+      if (!running.length) continue;
+      if (cmd) {
+        for (const node of running) {
+          const nTool = (node.dataset.toolName || '').toLowerCase();
+          const nCmd = (node.dataset.toolCmd || '').trim();
+          if (nTool === tool && nCmd === cmd) return node;
+        }
+      }
+      for (const node of running) {
+        if ((node.dataset.toolName || '').toLowerCase() === tool) return node;
+      }
+    }
+    if (fallback && fallback.classList.contains('running')) return fallback;
+    return fallback;
+  }
+
+  /** Закрывает running-карточки, для которых не пришёл tool_output. */
+  function _sweepOrphanedToolNodes(status) {
+    const label = status || 'interrupted';
+    document.querySelectorAll('.agent-thread-node.running').forEach(node => {
+      _stopToolNodeTickers(node);
+      node.classList.remove('running');
+      const icon = node.querySelector('.agent-thread-icon');
+      if (icon) icon.textContent = '\u25A0';
+      const wave = node.querySelector('.agent-thread-wave');
+      if (wave) wave.textContent = '';
+      let statusEl = node.querySelector('.agent-thread-status');
+      if (!statusEl) {
+        const header = node.querySelector('.agent-thread-header');
+        if (header) {
+          statusEl = document.createElement('span');
+          statusEl.className = 'agent-thread-status';
+          header.appendChild(statusEl);
+        }
+      }
+      if (statusEl) statusEl.textContent = label;
+    });
+  }
+
   // Per-session research tracking (supports concurrent research across sessions)
   const _researchingStreamIds = new Set();
   let _researchTimerEl = null, _researchTimerInterval = null;
@@ -302,25 +360,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       abortCurrentRequest(true);  // explicit user Stop → also cancel the detached server run
 
       // Clean up any running agent thread nodes (stop wave animation, remove "running" state)
-      document.querySelectorAll('.agent-thread-node.running').forEach(node => {
-        if (node._waveInterval) { clearInterval(node._waveInterval); node._waveInterval = null; }
-        if (node._elapsedTicker) { clearInterval(node._elapsedTicker); node._elapsedTicker = null; }
-        node.classList.remove('running');
-        const wave = node.querySelector('.agent-thread-wave');
-        if (wave) wave.textContent = '';
-        const icon = node.querySelector('.agent-thread-icon');
-        if (icon) icon.textContent = '\u25A0'; // stop square
-        const statusEl = node.querySelector('.agent-thread-status');
-        if (!statusEl) {
-          const header = node.querySelector('.agent-thread-header');
-          if (header) {
-            const s = document.createElement('span');
-            s.className = 'agent-thread-status';
-            s.textContent = 'stopped';
-            header.appendChild(s);
-          }
-        }
-      });
+      _sweepOrphanedToolNodes('stopped');
       document.querySelectorAll('.agent-thread.streaming').forEach(t => t.classList.remove('streaming'));
 
       // Clean up any thinking spinners
@@ -2102,6 +2142,8 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 const cmdHtml = cmd ? `<pre class="agent-thread-cmd">${esc(cmd)}</pre>` : '';
                 node.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">${toolIcon}</span><span class="agent-thread-tool">${esc(toolLabel)}</span><span class="agent-thread-wave">▁▂▃</span></div><div class="agent-thread-content">${cmdHtml}</div>`;
                 // Expand/collapse via delegated click handler (init at module bottom).
+                node.dataset.toolName = json.tool;
+                node.dataset.toolCmd = cmd;
                 threadWrap.appendChild(node);
                 currentToolBubble = node;
                 // Animate the wave
@@ -2142,17 +2184,18 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 // elapsed-time + tail of its stdout/stderr so the
                 // user doesn't stare at a blind "Running…" spinner.
                 if (_isBg) continue;
-                if (!currentToolBubble) continue;
+                const progressBubble = _resolveToolBubble(json, currentToolBubble);
+                if (!progressBubble) continue;
                 // The per-second ticker (started in tool_start) owns the
                 // elapsed display; here we just surface the live output tail.
                 const tailStr = (json.tail || '').trim();
                 if (tailStr) {
-                  let tailEl = currentToolBubble.querySelector('.agent-thread-tail');
+                  let tailEl = progressBubble.querySelector('.agent-thread-tail');
                   if (!tailEl) {
                     tailEl = document.createElement('pre');
                     tailEl.className = 'agent-thread-tail';
                     tailEl.style.cssText = 'margin:4px 0 0;padding:6px 8px;font-size:11px;background:rgba(0,0,0,0.18);border-radius:4px;max-height:140px;overflow:auto;white-space:pre-wrap;opacity:0.85;';
-                    const content = currentToolBubble.querySelector('.agent-thread-content');
+                    const content = progressBubble.querySelector('.agent-thread-content');
                     if (content) content.appendChild(tailEl);
                   }
                   tailEl.textContent = tailStr;
@@ -2162,17 +2205,10 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
 
               } else if (json.type === 'tool_output') {
                 if (_isBg) continue;
-                // --- Update the current thread node ---
-                if (currentToolBubble) {
-                  // Stop wave animation + the per-second cooking ticker
-                  if (currentToolBubble._waveInterval) {
-                    clearInterval(currentToolBubble._waveInterval);
-                    currentToolBubble._waveInterval = null;
-                  }
-                  if (currentToolBubble._elapsedTicker) {
-                    clearInterval(currentToolBubble._elapsedTicker);
-                    currentToolBubble._elapsedTicker = null;
-                  }
+                const toolBubble = _resolveToolBubble(json, currentToolBubble);
+                // --- Update the matching thread node ---
+                if (toolBubble) {
+                  _stopToolNodeTickers(toolBubble);
                   const ok = (json.exit_code === 0 || json.exit_code == null);
                   const cmd = json.command || '';
                   let outHtml = '';
@@ -2211,9 +2247,10 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                   // it as soon as the result lands, forcing the user to
                   // click again. Click handling is delegated (see init at
                   // bottom of file) so no per-node listener needed.
-                  const _wasOpen = currentToolBubble.classList.contains('open');
-                  currentToolBubble.className = 'agent-thread-node' + (ok ? '' : ' error') + (_wasOpen ? ' open' : '');
-                  currentToolBubble.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">${ok ? '\u2713' : '\u2717'}</span><span class="agent-thread-tool">${esc(json.tool)}</span><span class="agent-thread-status">${ok ? 'done' : 'failed'}</span><span class="agent-thread-chevron">\u25B6</span></div><div class="agent-thread-content">${cmdHtml2}${outHtml}${diffHtml}</div>`;
+                  const _wasOpen = toolBubble.classList.contains('open');
+                  toolBubble.className = 'agent-thread-node' + (ok ? '' : ' error') + (_wasOpen ? ' open' : '');
+                  toolBubble.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">${ok ? '\u2713' : '\u2717'}</span><span class="agent-thread-tool">${esc(json.tool)}</span><span class="agent-thread-status">${ok ? 'done' : 'failed'}</span><span class="agent-thread-chevron">\u25B6</span></div><div class="agent-thread-content">${cmdHtml2}${outHtml}${diffHtml}</div>`;
+                  if (currentToolBubble === toolBubble) currentToolBubble = null;
                   // Reset so thinking spinner between tools says "Thinking" not the old tool's label
                   _lastToolName = '';
                   uiModule.scrollHistory();
@@ -2227,8 +2264,8 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                   window.dispatchEvent(new CustomEvent('gallery-refresh'));
                 }
                 // --- Render browser screenshots in tool output ---
-                if (json.screenshot && currentToolBubble) {
-                  const contentEl = currentToolBubble.querySelector('.agent-thread-content');
+                if (json.screenshot && toolBubble) {
+                  const contentEl = toolBubble.querySelector('.agent-thread-content');
                   if (contentEl) {
                     const screenshotSrc = chatRenderer.safeToolScreenshotSrc(json.screenshot);
                     if (screenshotSrc) {
@@ -2457,6 +2494,8 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       _removeThinkingSpinner();
       // Stop any thread pulse animations
       document.querySelectorAll('.agent-thread.streaming').forEach(t => t.classList.remove('streaming'));
+      // Карточки tools без tool_output (параллельные fetch, обрыв SSE) — иначе таймер крутится вечно
+      _sweepOrphanedToolNodes('interrupted');
       // --- Final render (skip if stream was ever backgrounded or currently in background) ---
       // Remove streaming class from all round bubbles
       holder.classList.remove('streaming');
@@ -2858,17 +2897,8 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
           currentAbort = null;
         } else {
           console.error(err);
-          // Stream died with a tool node still spinning. Its per-node tickers
-          // (_elapsedTicker 50ms / _waveInterval 100ms) are normally cleared in
-          // `tool_output`, which will never arrive now — without this sweep they
-          // fire forever on the orphaned node (and auto-recover compounds it per
-          // nudge). Safe here: auto-recover's new send is deferred 200ms, so no
-          // fresh running nodes exist yet.
-          document.querySelectorAll('.agent-thread-node.running').forEach(node => {
-            if (node._waveInterval) { clearInterval(node._waveInterval); node._waveInterval = null; }
-            if (node._elapsedTicker) { clearInterval(node._elapsedTicker); node._elapsedTicker = null; }
-            node.classList.remove('running');
-          });
+          // Stream died with a tool node still spinning — sweep orphans (see _sweepOrphanedToolNodes).
+          _sweepOrphanedToolNodes('interrupted');
           // Stream died unexpectedly — the "silently died" case. Re-engage the
           // model immediately (no wait) with a completion handshake, up to the
           // cap. Only auto-recover from connection-class failures; deterministic

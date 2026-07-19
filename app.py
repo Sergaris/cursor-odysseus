@@ -933,6 +933,12 @@ app.router.lifespan_context = _lifespan
 async def _startup_event():
     global upload_cleanup_task
     logger.info("Application starting up...")
+    try:
+        from src.settings import sync_portable_search_at_startup
+
+        sync_portable_search_at_startup()
+    except Exception as e:
+        logger.warning("Portable search sync skipped: %s", e)
     webhook_manager.set_loop(asyncio.get_running_loop())
     # Wipe any leftover incognito sessions from previous process — they're
     # ephemeral by design and must not survive a restart.

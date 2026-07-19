@@ -3,7 +3,27 @@
 import os
 import sys
 
+from src.bundled_searxng import is_searxng_worker_process
 from src.python_runtime import PYTHON_WORKER_ENV
+
+
+def run_searxng_worker_if_requested() -> bool:
+    """Запускает встроенный SearXNG worker (sidecar) и завершает процесс.
+
+    Returns:
+        True, если процесс обработан как SearXNG worker.
+    """
+    if not is_searxng_worker_process():
+        return False
+    from src.runtime_paths import get_app_root
+
+    base_dir = get_app_root()
+    if base_dir not in sys.path:
+        sys.path.insert(0, base_dir)
+    from src.bundled_searxng_worker import run_bundled_searxng_worker
+
+    run_bundled_searxng_worker()
+    sys.exit(0)
 
 
 def is_python_worker_argv(argv: list[str] | None = None) -> bool:

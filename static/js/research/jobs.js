@@ -197,16 +197,37 @@ export function formatElapsed(ms) {
 export function formatPhase(progress, maxRounds) {
   if (!progress || !progress.phase) return 'Starting...';
   const p = progress;
+  if (p.step_description) return p.step_description;
   const rn = p.round ? (maxRounds ? `Round ${p.round}/${maxRounds}: ` : `Round ${p.round}: `) : '';
   switch (p.phase) {
     case 'probing': return 'Probing model...';
     case 'planning': return 'Planning research strategy...';
-    case 'searching': return `${rn}Searching (${p.queries || 0} queries)`;
+    case 'searching': {
+      const qCount = Array.isArray(p.queries) ? p.queries.length : (p.queries || 0);
+      return `${rn}Searching (${qCount} queries)`;
+    }
     case 'reading': return `${rn}Reading ${p.total_sources || 0} sources`;
     case 'analyzing': return `${rn}Analyzing ${p.total_findings || 0} findings`;
-    case 'writing': return `Writing report -- ${p.total_sources || 0} sources`;
+    case 'writing': return `Writing answer — ${p.total_sources || 0} sources`;
     default: return p.phase;
   }
+}
+
+function _mergeProgressStep(job, d) {
+  if (!d || !d.step) return;
+  if (!job.steps) job.steps = [];
+  let entry = job.steps.find(s => s.step === d.step);
+  if (!entry) {
+    entry = { step: d.step };
+    job.steps.push(entry);
+  }
+  if (d.step_description) entry.description = d.step_description;
+  if (d.phase) entry.phase = d.phase;
+  if (d.round) entry.round = d.round;
+  if (Array.isArray(d.queries)) entry.queries = d.queries;
+  if (d.insights) entry.insights = d.insights;
+  if (d.sources_preview) entry.sources_preview = d.sources_preview;
+  if (d.sources_more != null) entry.sources_more = d.sources_more;
 }
 
 function _makeJob(query, settings) {
@@ -215,7 +236,7 @@ function _makeJob(query, settings) {
     query, settings, status: 'queued',
     progress: {}, startedAt: null, elapsed: 0,
     result: null, sources: null, findings: null,
-    category: settings?.category || '',
+    steps: [],
     errorMsg: null, avgDuration: null,
     modelName: null, endpointName: null,
     _es: null, _timerInterval: null,
@@ -266,11 +287,12 @@ function _connectStream(job) {
       const d = JSON.parse(evt.data);
       if (d.status === 'not_found') { _finishJob(job, 'error'); return; }
       job.progress = d;
+      _mergeProgressStep(job, d);
       if (d.model && !job.modelName) job.modelName = d.model;
       if (d.final) {
         if (d.error) job.errorMsg = d.error;
         _finishJob(job, d.status === 'done' ? 'done' : d.status === 'cancelled' ? 'cancelled' : 'error');
-        if (d.status === 'done') _fetchResult(job);
+        if (d.status === 'done' || d.status === 'error') _fetchResult(job);
         return;
       }
       _notify();
@@ -290,10 +312,11 @@ async function _pollFallback(job) {
     if (!res.ok) { _finishJob(job, 'error'); return; }
     const d = await res.json();
     job.progress = d.progress || {};
+    _mergeProgressStep(job, job.progress);
     if (d.avg_duration) job.avgDuration = d.avg_duration;
     if (d.status !== 'running') {
       _finishJob(job, d.status === 'done' ? 'done' : 'error');
-      if (d.status === 'done') _fetchResult(job);
+      if (d.status === 'done' || d.status === 'error') _fetchResult(job);
       return;
     }
     setTimeout(() => _pollFallback(job), 2000);
@@ -327,6 +350,8 @@ async function _fetchResult(job) {
     job.result = d.result;
     job.sources = d.sources;
     job.findings = d.raw_findings;
+    if (d.stats) job.stats = d.stats;
+    if (d.failure_reason) job.failureReason = d.failure_reason;
     if (d.category && !job.category) job.category = d.category;
     _notify();
   } catch {}

@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 from typing import List, Optional
 from urllib.parse import urljoin, urlparse, parse_qs
 
@@ -38,13 +39,35 @@ def _get_search_settings() -> dict:
         return {}
 
 
+def _is_local_searxng_url(url: str) -> bool:
+    """True для localhost/127.0.0.1 — типичные bundled/docker URL."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
 def _get_search_instance() -> str:
     """Return the active search API URL from admin settings, falling back to env var."""
     settings = _get_search_settings()
-    url = (settings.get("search_url") or "").strip()
+    url = (settings.get("search_url") or "").strip().rstrip("/")
+
+    try:
+        from src.bundled_searxng import resolve_bundled_searxng_url
+
+        bundled = resolve_bundled_searxng_url(adopt=True)
+    except Exception:
+        bundled = ""
+
+    if bundled:
+        if not url or _is_local_searxng_url(url):
+            return bundled
+        return url
+
     if url:
-        return url.rstrip("/")
-    return SEARXNG_INSTANCE
+        return url
+    return SEARXNG_INSTANCE.rstrip("/")
 
 
 def _get_provider_key(provider: str) -> str:
@@ -132,6 +155,15 @@ _NEWS_HINTS = ("news", "nyheter", "headlines", "breaking", "latest", "today", "i
 _GENERAL_ENGINES = os.environ.get("SEARXNG_GENERAL_ENGINES", "bing,mojeek,presearch")
 
 
+def _detect_search_language(query: str) -> str | None:
+    """Подсказка языка для SearXNG по тексту запроса."""
+    if re.search(r"[\u0400-\u04ff]", query):
+        return "ru"
+    if re.search(r"[a-zA-Z]", query):
+        return "en"
+    return None
+
+
 def searxng_search_api(query: str, count: Optional[int] = None, categories: str = "general",
                        time_filter: Optional[str] = None) -> List[dict]:
     """Search using SearXNG JSON API. Returns list of {title, url, snippet}."""
@@ -147,16 +179,16 @@ def searxng_search_api(query: str, count: Optional[int] = None, categories: str 
     # freshness (time_filter) or the query reads like a news lookup, switch to
     # the 'news' category, constrain recency, and pin language to English so a
     # search like "Canada latest news" returns actual news instead of Wikipedia.
-    # Pin English for ALL searches — without it, SearXNG geolocates / mixes
-    # languages and brand-ambiguous terms bleed in foreign SEO pages (e.g.
-    # "Odyssey" → Honda Japan, "Trojan" → Japanese malware blogs, "Polyphemus"
-    # → Chinese math forums). The news path already did this; general didn't.
+    # Pin language from query script when possible — English-only pin breaks
+    # Cyrillic deep-research / people lookups until the no-language retry.
+    lang_hint = _detect_search_language(query)
     params = {
         "q": query,
         "format": "json",
-        "language": "en",
         "safesearch": _safesearch_for("searxng"),
     }
+    if lang_hint:
+        params["language"] = lang_hint
     q_lc = query.lower()
     is_news = time_filter is not None or any(h in q_lc for h in _NEWS_HINTS)
     if is_news and categories == "general":
@@ -203,10 +235,11 @@ def searxng_search_api(query: str, count: Optional[int] = None, categories: str 
             fallback = {
                 "q": query,
                 "format": "json",
-                "language": "en",
                 "categories": "general",
                 "safesearch": _safesearch_for("searxng"),
             }
+            if lang_hint:
+                fallback["language"] = lang_hint
             if _GENERAL_ENGINES:
                 fallback["engines"] = _GENERAL_ENGINES
             logger.info(

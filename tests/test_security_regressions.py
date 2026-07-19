@@ -1202,11 +1202,8 @@ def test_md_to_html_preserves_normal_report_formatting():
     assert 'rel="noopener' in out                     # ...and rel-hardened
 
 
-def test_visual_report_escapes_request_category():
-    # `category` arrives straight from the /api/research/start request body with
-    # no enum validation and lands in <body class="category-{category}"> on a
-    # report page served under `script-src 'unsafe-inline'`, so it must be escaped
-    # or it's an attribute-injection XSS independent of the markdown body.
+def test_visual_report_ignores_category_for_body_class():
+    """Category param is ignored — reports use neutral styling (no body class injection)."""
     from src.visual_report import generate_visual_report
 
     html = generate_visual_report(
@@ -1215,10 +1212,8 @@ def test_visual_report_escapes_request_category():
         category='"><script>alert(document.domain)</script>',
     )
 
-    assert "<script>alert(document.domain)" not in html   # no breakout
-    assert "&lt;script&gt;" in html                        # rendered as inert text
+    assert "<script>alert(document.domain)" not in html
+    assert 'class="category-' not in html
 
-    # `category` has no type check at the request boundary, so a non-string
-    # value must coerce rather than crash the render (html.escape needs a str).
     out = generate_visual_report(question="q", report_markdown="## H", category=12345)
-    assert "category-12345" in out
+    assert "category-12345" not in out

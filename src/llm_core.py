@@ -33,13 +33,27 @@ class LLMConfig:
     CONNECT_TIMEOUT = float(os.getenv('LLM_CONNECT_TIMEOUT', '10') or '10')
 
 
+def _unlimited_read_timeout(read_timeout) -> bool:
+    """True when the caller wants no read/inference time cap."""
+    if read_timeout is None:
+        return True
+    try:
+        return float(read_timeout) <= 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _call_timeout(read_timeout) -> httpx.Timeout:
     """Per-request timeout for non-streaming LLM calls (connect from config)."""
+    if _unlimited_read_timeout(read_timeout):
+        return httpx.Timeout(connect=LLMConfig.CONNECT_TIMEOUT, read=None, write=10.0, pool=5.0)
     return httpx.Timeout(connect=LLMConfig.CONNECT_TIMEOUT, read=float(read_timeout), write=10.0, pool=5.0)
 
 
 def _stream_timeout(read_timeout) -> httpx.Timeout:
     """Per-request timeout for streaming LLM calls (connect from config)."""
+    if _unlimited_read_timeout(read_timeout):
+        return httpx.Timeout(connect=LLMConfig.CONNECT_TIMEOUT, read=None, write=30.0, pool=5.0)
     return httpx.Timeout(connect=LLMConfig.CONNECT_TIMEOUT, read=float(read_timeout), write=30.0, pool=5.0)
 
 

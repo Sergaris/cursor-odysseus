@@ -21,7 +21,16 @@ Handles:
 import os
 import sys
 
-# Subprocess modes: python tool script or MCP server — no GUI.
+# Subprocess modes: SearXNG sidecar, python tool script, or MCP server — no GUI.
+if os.environ.get("ODYSSEUS_SEARXNG_WORKER") == "1":
+    from src.uvloop_compat import install_simplexng_platform_stubs
+
+    install_simplexng_platform_stubs()
+    from src.subprocess_entry import run_searxng_worker_if_requested
+
+    run_searxng_worker_if_requested()
+    sys.exit(0)
+
 try:
     from src.subprocess_entry import (
         is_mcp_worker_argv,
@@ -78,7 +87,9 @@ def _enforce_single_desktop_instance() -> None:
     if not getattr(sys, "frozen", False) and not should_use_desktop_shell():
         return
     from src.subprocess_entry import is_mcp_worker_argv, is_python_worker_argv
-    if is_python_worker_argv() or is_mcp_worker_argv():
+    from src.bundled_searxng import is_searxng_worker_process
+
+    if is_python_worker_argv() or is_mcp_worker_argv() or is_searxng_worker_process():
         return
     from src.desktop_single_instance import ensure_single_desktop_instance
     if not ensure_single_desktop_instance():

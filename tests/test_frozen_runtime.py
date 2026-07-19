@@ -44,6 +44,11 @@ def test_configure_frozen_runtime_sets_bridge_env(tmp_path: Path, monkeypatch: p
     bridge.parent.mkdir(parents=True)
     bridge.write_text("@echo off\r\n", encoding="utf-8")
     monkeypatch.delenv("CURSOR_SDK_BRIDGE_BIN", raising=False)
+    scheduled: list[bool] = []
+    monkeypatch.setattr(
+        "src.bundled_searxng.schedule_bundled_searxng_background",
+        lambda: scheduled.append(True),
+    )
 
     with mock.patch.object(sys, "frozen", True, create=True), \
          mock.patch.object(sys, "_MEIPASS", str(tmp_path), create=True):
@@ -51,3 +56,4 @@ def test_configure_frozen_runtime_sets_bridge_env(tmp_path: Path, monkeypatch: p
 
     assert os.environ["CURSOR_SDK_BRIDGE_BIN"] == str(bridge)
     assert os.path.isdir(ensure_default_workspace_dir())
+    assert scheduled == [True]

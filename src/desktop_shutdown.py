@@ -257,6 +257,12 @@ def shutdown_odysseus_desktop(
             logger.exception("Ошибка остановки uvicorn")
 
     _shutdown_cursor_sdk_sync()
+    try:
+        from src.bundled_searxng import stop_bundled_searxng
+
+        stop_bundled_searxng()
+    except Exception:
+        logger.exception("Не удалось остановить bundled SearXNG")
     cleanup_straggler_processes(root_pid)
     _release_desktop_instance_lock()
     os._exit(0)

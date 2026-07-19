@@ -75,7 +75,6 @@ function _saveSettingsToStorage() {
       search_provider: document.getElementById('research-search-provider')?.value || '',
       endpoint_id: document.getElementById('research-endpoint')?.value || '',
       model: document.getElementById('research-model')?.value || '',
-      category: document.getElementById('research-category')?.value || '',
     }));
   } catch {}
 }
@@ -383,16 +382,6 @@ function _buildPanelHTML() {
             <select id="research-rounds">${roundOpts}</select>
           </label>
           <label class="research-setting">
-            <span class="research-setting-label">Format <span class="hwfit-help-chip hwfit-help-chip-inline" title="Auto lets the LLM pick the output shape. Override when you specifically want a Compare table, How-to, Product, or Fact-check.">?</span></span>
-            <select id="research-category">
-              <option value="" selected>Auto</option>
-              <option value="product">Product</option>
-              <option value="comparison">Compare</option>
-              <option value="howto">How-to</option>
-              <option value="factcheck">Fact-check</option>
-            </select>
-          </label>
-          <label class="research-setting">
             <span class="research-setting-label">Search engine</span>
             <select id="research-search-provider">${providerOpts}</select>
           </label>
@@ -438,11 +427,8 @@ function _dismissKeyboard(input) {
   } catch {}
 }
 
-/** Reset the category selector back to "Auto" (called after each start). */
-function _resetCategoryToAuto() {
-  const sel = document.getElementById('research-category');
-  if (sel) sel.value = '';
-}
+/** @deprecated — category selector removed; no-op for callers. */
+function _resetCategoryToAuto() {}
 
 function _wireEvents(pane) {
   pane.querySelector('#research-panel-close').addEventListener('click', closePanel);
@@ -480,13 +466,11 @@ function _wireEvents(pane) {
 }
 
 function _readSettings() {
-  const category = document.getElementById('research-category')?.value || undefined;
   const settings = {
     max_rounds: parseInt(document.getElementById('research-rounds')?.value || '0', 10),
     search_provider: document.getElementById('research-search-provider')?.value || undefined,
     endpoint_id: document.getElementById('research-endpoint')?.value || undefined,
     model: document.getElementById('research-model')?.value || undefined,
-    category: category || undefined,
   };
   const epSel = document.getElementById('research-endpoint');
   if (epSel && epSel.value) {
@@ -517,10 +501,6 @@ function _editJob(job) {
     queryEl.focus();
     queryEl.setSelectionRange(queryEl.value.length, queryEl.value.length);
   }
-  // Restore category
-  const cat = job.category || '';
-  const catSel = document.getElementById('research-category');
-  if (catSel) catSel.value = cat;
   // Restore settings
   const s = job.settings || {};
   const roundsEl = document.getElementById('research-rounds');
@@ -606,10 +586,6 @@ async function _handleStart() {
 function _restoreSavedSettings() {
   const saved = _loadSettingsFromStorage();
   if (!saved) return;
-  if (saved.category !== undefined) {
-    const catSel = document.getElementById('research-category');
-    if (catSel) catSel.value = saved.category;
-  }
   // Rounds intentionally defaults to "Auto" on every open — don't restore.
   // Users can pick a specific cap each time if needed.
   const search = document.getElementById('research-search-provider');
@@ -885,11 +861,36 @@ function _promptParallelOrSequential(count, anchorBtn) {
   });
 }
 
+function _renderStepLog(job) {
+  const steps = job.steps || [];
+  if (!steps.length) return '';
+  const completed = steps.length;
+  let items = '';
+  for (const s of steps.slice(-8)) {
+    const title = _esc(s.description || s.phase || 'Step');
+    const queries = Array.isArray(s.queries) && s.queries.length
+      ? `<div class="research-step-queries">${s.queries.map(q => `• ${_esc(q)}`).join(' ')}</div>`
+      : '';
+    let sourcesLine = '';
+    if (s.sources_preview?.length) {
+      const names = s.sources_preview.map(sp => _esc(sp.domain || sp.url || '')).join(', ');
+      const more = s.sources_more > 0 ? ` +${s.sources_more}` : '';
+      sourcesLine = `<div class="research-step-sources">${names}${more}</div>`;
+    }
+    let insightsBlock = '';
+    if (s.insights?.length) {
+      const bullets = s.insights.map(i => `<li>${_esc(i)}</li>`).join('');
+      insightsBlock = `<details class="research-step-insights"><summary>Insights</summary><ul>${bullets}</ul></details>`;
+    }
+    items += `<div class="research-step-item"><div class="research-step-title">${title}</div>${queries}${sourcesLine}${insightsBlock}</div>`;
+  }
+  return `<div class="research-step-log"><div class="research-step-header">Завершено ${completed} шагов</div>${items}</div>`;
+}
+
 function _buildJobCard(job) {
   const card = document.createElement('div');
   card.className = `research-job-card ${job.status}${job._fromLibrary ? ' from-library' : ''}`;
   card.dataset.jobId = job.id;
-  if (job.category) card.dataset.category = job.category;
 
   const elapsed = jobs.formatElapsed(job.elapsed || 0);
   const isExpanded = _expandedJobId === job.id;
@@ -904,7 +905,7 @@ function _buildJobCard(job) {
     const meta = [mName, epName, roundsLabel].filter(Boolean).join(' -- ');
     card.innerHTML = `
       <div class="research-job-header">
-        <span class="research-job-query">${_esc(job.query)}</span>${job.category ? `<span class="research-cat-badge">${_esc(job.category)}</span>` : ""}
+        <span class="research-job-query">${_esc(job.query)}</span>
       </div>
       <div class="research-job-queued-meta">${_esc(meta)}</div>
       <div class="research-job-actions">
@@ -932,15 +933,17 @@ function _buildJobCard(job) {
     const round = job.progress?.round || 0;
     const barCap = userMaxR || 8;
     const pct = Math.min(100, Math.round((round / barCap) * 100));
+    const stepLog = _renderStepLog(job);
     card.innerHTML = `
       <div class="research-job-header">
-        <span class="research-job-query">${_esc(job.query)}</span>${job.category ? `<span class="research-cat-badge">${_esc(job.category)}</span>` : ""}
+        <span class="research-job-query">${_esc(job.query)}</span>
         ${modelTag}
         <span class="research-job-time">${elapsed}</span>
         <button class="research-synapse-toggle${_synapseMinimized ? ' active' : ''}" title="${_synapseMinimized ? 'Show visualization' : 'Minimize visualization'}">${_synapseMinimized ? _vizExpandIcon : _vizCollapseIcon}</button>
         <button class="research-job-cancel" title="Cancel research">${_cancelIcon}</button>
       </div>
       <div class="research-job-phase">${phase}</div>
+      ${stepLog}
       <div class="research-job-synapse-host${_synapseMinimized ? ' synapse-collapsed' : ''}" data-synapse-host="${job.id}"></div>
       <div class="research-progress-bar"><div class="research-progress-fill" style="width:${pct}%"></div></div>
     `;
@@ -985,20 +988,38 @@ function _buildJobCard(job) {
     // Library-loaded jobs have sources=null but pre-set sourceCount; fresh jobs
     // populate sources directly. Prefer the pre-set count if present.
     const srcCount = job.sources?.length ?? job.sourceCount ?? 0;
-    // 0 sources = the research couldn't gather/extract anything — flag it.
+    const urlCount = job.stats?.URLs ?? job.stats?.urls ?? null;
+    const extracted = job.stats?.Extracted ?? job.stats?.extracted ?? null;
+    const failureReason = job.failureReason || job.stats?.FailureReason || '';
+    const runTimeoutFail = failureReason === 'run_timeout'
+      || /timed out after \d+s/i.test(job.result || '')
+      || /timed out after \d+s/i.test(job.errorMsg || '');
+    const llmExtractFail = failureReason === 'llm_extraction'
+      || (urlCount > 0 && srcCount === 0 && extracted === 0 && !runTimeoutFail);
+    const searchFail = srcCount === 0 && !llmExtractFail && !runTimeoutFail && (urlCount === 0 || urlCount == null);
     const failed = srcCount === 0;
     if (failed) card.classList.add('research-job-failed');
     const doneBadge = failed
       ? `<span class="research-cat-badge research-cat-failed">${_cancelIcon} no results</span>`
-      : (job.category ? `<span class="research-cat-badge">${_esc(job.category)}</span>` : `<span class="research-cat-badge research-cat-standard">standard</span>`);
-    const failNote = failed
-      ? `<div class="research-job-failnote">Couldn't extract anything — try rephrasing the question, or switch the search engine in Settings.</div>`
+      : '';
+    let failNote = '';
+    if (runTimeoutFail) {
+      failNote = '<div class="research-job-failnote">Research hit the run time limit before finishing. Slow local models can take over an hour — run time limits are now disabled in Settings.</div>';
+    } else if (llmExtractFail) {
+      failNote = '<div class="research-job-failnote">LLM extraction failed. Try a faster model or check that the endpoint responds to chat completions.</div>';
+    } else if (searchFail) {
+      failNote = '<div class="research-job-failnote">Couldn\'t find pages — try rephrasing the question, or switch the search engine in Settings.</div>';
+    } else if (failed) {
+      failNote = '<div class="research-job-failnote">Couldn\'t extract anything — try rephrasing the question, or switch the search engine in Settings.</div>';
+    }
+    const statsLine = (urlCount != null && extracted != null)
+      ? `<span class="research-job-stats">${urlCount} URLs · ${extracted} extracted</span>`
       : '';
     card.innerHTML = `
       <div class="research-job-header">
         <span class="research-job-query">${_esc(job.query)}</span>${doneBadge}
         ${modelTag}
-        <span class="research-job-meta">${elapsed} -- ${srcCount} sources</span>
+        <span class="research-job-meta">${elapsed} -- ${srcCount} sources ${statsLine}</span>
       </div>
       ${failNote}
       <div class="research-job-actions">
@@ -1048,7 +1069,7 @@ function _buildJobCard(job) {
     const errMsg = job.errorMsg ? `<div class="research-job-error">${_esc(job.errorMsg)}</div>` : '';
     card.innerHTML = `
       <div class="research-job-header">
-        <span class="research-job-query">${_esc(job.query)}</span>${job.category ? `<span class="research-cat-badge">${_esc(job.category)}</span>` : ""}
+        <span class="research-job-query">${_esc(job.query)}</span>
         <span class="research-job-status">${job.status}</span>
       </div>
       ${errMsg}
@@ -1090,24 +1111,8 @@ const _CAT_LABELS = {
 
 function _renderResult(job) {
   if (!job.result) return '<div class="research-job-loading">Loading result...</div>';
-  const cat = job.category || '';
-  const catIcon = _CAT_ICONS[cat] || '';
-  const catLabel = _CAT_LABELS[cat] || '';
 
   let html = '';
-
-  // Category hero banner — only for completed, known-category results
-  if (cat && catIcon) {
-    html += `
-      <div class="research-hero research-hero-${cat}">
-        <span class="research-hero-icon">${catIcon}</span>
-        <div class="research-hero-text">
-          <div class="research-hero-label">${catLabel}</div>
-          <div class="research-hero-query">${_esc(job.query)}</div>
-        </div>
-      </div>
-    `;
-  }
 
   if (job.sources?.length) {
     html += '<div class="research-job-sources">';
@@ -1122,7 +1127,7 @@ function _renderResult(job) {
     html += '</div>';
   }
 
-  const bodyCls = `research-job-report-body${cat ? ' research-body-' + cat : ''}`;
+  const bodyCls = 'research-job-report-body';
   if (_markdownModule) {
     html += `<div class="${bodyCls}">${_markdownModule.renderContent(job.result)}</div>`;
   } else {
@@ -1142,6 +1147,8 @@ async function _ensureResult(job) {
     job.result = d.result;
     job.sources = d.sources;
     job.findings = d.raw_findings;
+    if (d.stats) job.stats = d.stats;
+    if (d.failure_reason) job.failureReason = d.failure_reason;
   } catch {}
 }
 
