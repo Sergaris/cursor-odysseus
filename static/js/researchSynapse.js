@@ -3,6 +3,9 @@
 // Live SVG visualization of a deep-research run: central query node with
 // sub-question branches and source leaves that pop in as rounds progress.
 // Driven imperatively by chat.js when SSE research_progress events arrive.
+//
+// Density rule: never draw one circle per source. Cap visible leaves per
+// round and fold the rest into a "+N" badge so 100+ sources stay readable.
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -17,8 +20,12 @@ const PHASE_LABEL = {
   done:      'complete',
 };
 
+/** Hard cap on drawn leaf circles per round node. */
+const MAX_VISIBLE_LEAVES = 5;
+/** Max round hubs on the ring. */
+const MAX_SUBS = 8;
+
 function rand(a, b) { return Math.random() * (b - a) + a; }
-function pick(arr)  { return arr[Math.floor(Math.random() * arr.length)]; }
 
 export default function createResearchSynapse(container, opts = {}) {
   const W = 520, H = 220;
@@ -46,7 +53,6 @@ export default function createResearchSynapse(container, opts = {}) {
   `;
   container.appendChild(wrap);
 
-  const svg     = wrap.querySelector('svg');
   const edgesG  = wrap.querySelector('.rs-edges');
   const nodesG  = wrap.querySelector('.rs-nodes');
   const statusE = wrap.querySelector('.rs-status');
@@ -68,10 +74,12 @@ export default function createResearchSynapse(container, opts = {}) {
   rootLabel.textContent = _trunc(opts.query || 'query', 28);
   nodesG.appendChild(rootLabel);
 
-  const subs = []; // { x, y, count }
+  // { x, y, count, labelEl, leafEls: [{edge, node}], badgeEdge, badgeNode, badgeText }
+  const subs = [];
   let sourceCount = 0;
   let lastRound = 0;
   let completed = false;
+  let leafAnimToken = 0;
 
   // ── timer ──────────────────────────────────────────────────────
   const startedAt = opts.startedAt || Date.now();
@@ -89,14 +97,102 @@ export default function createResearchSynapse(container, opts = {}) {
     return s.length > n ? s.slice(0, n - 1) + '…' : s;
   }
 
+  function _subLabelText(sub, baseLabel) {
+    const base = baseLabel || sub.baseLabel || '';
+    if (!sub.count) return base;
+    return `${base} · ${sub.count}`;
+  }
+
+  function _updateSubLabel(sub) {
+    if (!sub.labelEl) return;
+    sub.labelEl.textContent = _trunc(_subLabelText(sub), 16);
+  }
+
+  function _badgePos(sub) {
+    const baseAngle = Math.atan2(sub.y - cy, sub.x - cx);
+    const r = 34;
+    return {
+      x: sub.x + Math.cos(baseAngle) * r,
+      y: sub.y + Math.sin(baseAngle) * r,
+    };
+  }
+
+  function _ensureBadge(sub) {
+    if (sub.badgeNode) return;
+    const pos = _badgePos(sub);
+    const edge = document.createElementNS(SVG_NS, 'line');
+    edge.setAttribute('x1', sub.x); edge.setAttribute('y1', sub.y);
+    edge.setAttribute('x2', pos.x); edge.setAttribute('y2', pos.y);
+    edge.setAttribute('class', 'rs-edge');
+    edgesG.appendChild(edge);
+
+    const node = document.createElementNS(SVG_NS, 'circle');
+    node.setAttribute('cx', pos.x); node.setAttribute('cy', pos.y);
+    node.setAttribute('r', 9);
+    node.setAttribute('class', 'rs-node rs-node-badge');
+    nodesG.appendChild(node);
+
+    const text = document.createElementNS(SVG_NS, 'text');
+    text.setAttribute('x', pos.x);
+    text.setAttribute('y', pos.y + 3.5);
+    text.setAttribute('text-anchor', 'middle');
+    text.setAttribute('class', 'rs-badge-label');
+    nodesG.appendChild(text);
+
+    sub.badgeEdge = edge;
+    sub.badgeNode = node;
+    sub.badgeText = text;
+  }
+
+  function _updateBadge(sub) {
+    const overflow = Math.max(0, sub.count - (sub.collapsed ? 0 : Math.min(sub.leafEls.length, MAX_VISIBLE_LEAVES)));
+    const showCount = sub.collapsed ? sub.count : overflow;
+    if (showCount <= 0 && !sub.collapsed) {
+      if (sub.badgeNode) {
+        sub.badgeEdge?.remove();
+        sub.badgeNode.remove();
+        sub.badgeText?.remove();
+        sub.badgeEdge = sub.badgeNode = sub.badgeText = null;
+      }
+      return;
+    }
+    _ensureBadge(sub);
+    const label = sub.collapsed ? String(sub.count) : `+${showCount}`;
+    sub.badgeText.textContent = label;
+    sub.badgeNode.classList.add('rs-node-new');
+    setTimeout(() => sub.badgeNode?.classList.remove('rs-node-new'), 600);
+  }
+
+  /** Older rounds: drop individual leaves, keep a single count badge. */
+  function _collapseSub(sub) {
+    if (sub.collapsed) {
+      _updateBadge(sub);
+      _updateSubLabel(sub);
+      return;
+    }
+    sub.collapsed = true;
+    for (const leaf of sub.leafEls) {
+      leaf.edge?.remove();
+      leaf.node?.remove();
+    }
+    sub.leafEls = [];
+    _updateBadge(sub);
+    _updateSubLabel(sub);
+  }
+
   function _addSub(label) {
-    if (subs.length >= 10) return; // cap visual clutter
-    // Spread subs around a circle; reserve slight offset so first sub doesn't
-    // sit directly above the root label.
+    if (subs.length >= MAX_SUBS) {
+      // Ring is full — keep attributing activity to the last hub.
+      return null;
+    }
+    // Collapse previous active round so only the newest keeps leaf fans.
+    if (subs.length) _collapseSub(subs[subs.length - 1]);
+
     const slot = subs.length;
-    const totalSlots = Math.max(6, subs.length + 1);
+    const totalSlots = Math.max(6, Math.min(MAX_SUBS, subs.length + 1));
     const angle = (slot / totalSlots) * Math.PI * 2 - Math.PI / 2;
-    const r = 78;
+    // Pull hubs slightly inward when the ring is crowded.
+    const r = subs.length >= 6 ? 68 : 78;
     const x = cx + Math.cos(angle) * r;
     const y = cy + Math.sin(angle) * r;
 
@@ -112,43 +208,37 @@ export default function createResearchSynapse(container, opts = {}) {
     n.setAttribute('class', 'rs-node rs-node-sub rs-node-new');
     nodesG.appendChild(n);
 
-    if (label) {
-      const t = document.createElementNS(SVG_NS, 'text');
-      // Position label outside the circle on the same angle
-      const lx = cx + Math.cos(angle) * (r + 14);
-      const ly = cy + Math.sin(angle) * (r + 14);
-      t.setAttribute('x', lx); t.setAttribute('y', ly + 3);
-      t.setAttribute('text-anchor', Math.cos(angle) > 0.15 ? 'start' :
-                                    Math.cos(angle) < -0.15 ? 'end' : 'middle');
-      t.setAttribute('class', 'rs-label rs-label-sub');
-      t.textContent = _trunc(label, 14);
-      nodesG.appendChild(t);
-    }
+    const baseLabel = label || `R${slot + 1}`;
+    const t = document.createElementNS(SVG_NS, 'text');
+    const lx = cx + Math.cos(angle) * (r + 14);
+    const ly = cy + Math.sin(angle) * (r + 14);
+    t.setAttribute('x', lx); t.setAttribute('y', ly + 3);
+    t.setAttribute('text-anchor', Math.cos(angle) > 0.15 ? 'start' :
+                                  Math.cos(angle) < -0.15 ? 'end' : 'middle');
+    t.setAttribute('class', 'rs-label rs-label-sub');
+    t.textContent = _trunc(baseLabel, 14);
+    nodesG.appendChild(t);
 
-    subs.push({ x, y, count: 0 });
+    const sub = {
+      x, y, count: 0, collapsed: false,
+      baseLabel, labelEl: t,
+      leafEls: [],
+      badgeEdge: null, badgeNode: null, badgeText: null,
+    };
+    subs.push(sub);
+    return sub;
   }
 
-  function _addLeaf() {
-    if (!subs.length) _addSub('');
-    // Always attach the new source to the CURRENT round's sub (i.e. the
-    // most-recently-added one). That gives a clean per-round attribution
-    // — 10 sources across 3 rounds ends up as 10/10/10 across the three
-    // sub-nodes, not a random scatter.
-    const sub = subs[subs.length - 1];
-    sub.count++;
-    // Lay leaves out in concentric arcs around the sub: 6 per ring fanned
-    // across ~140°, then a second ring further out for the next 6, etc.
-    // Keeps things readable past 10+ leaves per sub.
+  function _addVisibleLeaf(sub) {
     const baseAngle = Math.atan2(sub.y - cy, sub.x - cx);
-    const idx = sub.count - 1;
-    const perRing = 6;
-    const ring = Math.floor(idx / perRing);
+    const idx = sub.leafEls.length;
+    const perRing = MAX_VISIBLE_LEAVES;
     const slot = idx % perRing;
-    const arcSpan = 2.4;
-    const angle = baseAngle + (slot - (perRing - 1) / 2) * (arcSpan / perRing) + rand(-0.05, 0.05);
-    const r = 26 + ring * 14 + rand(-1.5, 1.5);
-    const lx = sub.x + Math.cos(angle) * r;
-    const ly = sub.y + Math.sin(angle) * r;
+    const arcSpan = 1.8;
+    const angle = baseAngle + (slot - (perRing - 1) / 2) * (arcSpan / perRing) + rand(-0.03, 0.03);
+    const leafR = 22 + rand(-1, 1);
+    const lx = sub.x + Math.cos(angle) * leafR;
+    const ly = sub.y + Math.sin(angle) * leafR;
 
     const edge = document.createElementNS(SVG_NS, 'line');
     edge.setAttribute('x1', sub.x); edge.setAttribute('y1', sub.y);
@@ -159,9 +249,31 @@ export default function createResearchSynapse(container, opts = {}) {
 
     const leaf = document.createElementNS(SVG_NS, 'circle');
     leaf.setAttribute('cx', lx); leaf.setAttribute('cy', ly);
-    leaf.setAttribute('r', 4);
+    leaf.setAttribute('r', 3.5);
     leaf.setAttribute('class', 'rs-node rs-node-leaf rs-node-new');
     nodesG.appendChild(leaf);
+
+    sub.leafEls.push({ edge, node: leaf });
+  }
+
+  function _registerSources(sub, n) {
+    if (!sub || n <= 0) return;
+    sub.count += n;
+    if (sub.collapsed) {
+      _updateBadge(sub);
+      _updateSubLabel(sub);
+      return;
+    }
+    const room = Math.max(0, MAX_VISIBLE_LEAVES - sub.leafEls.length);
+    const toDraw = Math.min(room, n);
+    for (let i = 0; i < toDraw; i++) _addVisibleLeaf(sub);
+    _updateBadge(sub);
+    _updateSubLabel(sub);
+  }
+
+  function _activeSub() {
+    if (!subs.length) return _addSub('R1');
+    return subs[subs.length - 1];
   }
 
   // ── public API ─────────────────────────────────────────────────
@@ -173,39 +285,67 @@ export default function createResearchSynapse(container, opts = {}) {
       if (completed) return;
       const label = PHASE_LABEL[phase] || phase || '';
       let txt = label;
-      if (phase === 'searching' && extra.queries) txt += ` · ${extra.queries} queries`;
-      else if (phase === 'reading' && extra.title) txt = `reading: ${_trunc(extra.title, 32)}`;
-      else if (phase === 'analyzing' && extra.total_findings) txt += ` · ${extra.total_findings} findings`;
+      if (phase === 'searching' && extra.queries) {
+        const q = Array.isArray(extra.queries) ? extra.queries.length : extra.queries;
+        txt += ` · ${q} queries`;
+      } else if (phase === 'reading' && extra.title) {
+        txt = `reading: ${_trunc(extra.title, 32)}`;
+      } else if (phase === 'reading' && extra.step_description) {
+        txt = _trunc(extra.step_description, 40).toLowerCase();
+      } else if (phase === 'analyzing' && extra.total_findings) {
+        txt += ` · ${extra.total_findings} findings`;
+      }
       statusE.textContent = txt;
-      // Visual cue per phase
       if (phase === 'error') wrap.classList.add('rs-error');
     },
 
     /** Bump the round counter — adds a sub-question node when round grows. */
-    setRound(round, opts = {}) {
+    setRound(round, roundOpts = {}) {
       if (completed) return;
       if (typeof round !== 'number' || round < 1) return;
       if (round > lastRound) {
-        // Add one sub-question node per new round we see
-        for (let i = lastRound; i < round && subs.length < 10; i++) {
-          _addSub(opts.label || `R${i + 1}`);
+        for (let i = lastRound; i < round; i++) {
+          if (subs.length >= MAX_SUBS) {
+            // Attribute further rounds to the last hub (collapsed count).
+            const last = subs[subs.length - 1];
+            if (last) {
+              last.baseLabel = roundOpts.label || `R${round}`;
+              _updateSubLabel(last);
+            }
+            break;
+          }
+          _addSub(roundOpts.label || `R${i + 1}`);
         }
         lastRound = round;
         roundE.textContent = round;
       }
     },
 
-    /** Update the total source count — adds leaf nodes for any new sources. */
+    /** Update the total source count — capped leaf fan + "+N" overflow. */
     setSourceCount(total) {
       if (completed) return;
       if (typeof total !== 'number' || total <= sourceCount) return;
-      const delta = Math.min(total - sourceCount, 6); // animate at most 6 at a time
-      for (let i = 0; i < delta; i++) {
-        // Stagger leaves slightly so they don't all pop on the same frame
-        setTimeout(_addLeaf, i * 110);
-      }
+      const delta = total - sourceCount;
       sourceCount = total;
       srcE.textContent = total;
+
+      const sub = _activeSub();
+      // Animate at most a few new visible dots; the rest go straight to badge.
+      const anim = Math.min(delta, Math.max(0, MAX_VISIBLE_LEAVES - (sub?.leafEls.length || 0)), 4);
+      const token = ++leafAnimToken;
+      for (let i = 0; i < anim; i++) {
+        setTimeout(() => {
+          if (token !== leafAnimToken || completed) return;
+          _registerSources(_activeSub(), 1);
+        }, i * 90);
+      }
+      const rest = delta - anim;
+      if (rest > 0) {
+        setTimeout(() => {
+          if (token !== leafAnimToken || completed) return;
+          _registerSources(_activeSub(), rest);
+        }, anim * 90);
+      }
     },
 
     /** Mark the run as done — freezes the pulse and tints the graph green. */
@@ -214,10 +354,13 @@ export default function createResearchSynapse(container, opts = {}) {
       completed = true;
       wrap.classList.add('rs-complete');
       statusE.textContent = 'complete';
+      // Collapse everything to round hubs + counts for a clean final frame.
+      for (const sub of subs) _collapseSub(sub);
       if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
     },
 
     destroy() {
+      leafAnimToken++;
       if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
       if (wrap.parentNode) wrap.parentNode.removeChild(wrap);
     },

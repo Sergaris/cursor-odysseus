@@ -67,6 +67,21 @@ _TRUSTED_NEWS_DOMAINS = {
     "www.theguardian.com", "euronews.com", "www.euronews.com",
     "dw.com", "www.dw.com", "government.se", "www.government.se",
 }
+_SECONDARY_DISCUSSION_DOMAINS = {
+    "reddit.com", "www.reddit.com", "news.ycombinator.com",
+    "stackoverflow.com", "www.stackoverflow.com",
+    "medium.com", "www.medium.com", "dev.to", "www.dev.to",
+}
+_DOCS_PATH_HINTS = (
+    "/docs/", "/documentation/", "/api/", "/reference/",
+)
+_DOCS_HOST_HINTS = (
+    "docs.", "developer.", "developers.",
+)
+_PRODUCT_QUERY_HINTS = {
+    "sdk", "api", "docs", "documentation", "library", "package",
+    "typescript", "python", "endpoint", "reference",
+}
 
 
 def _domain(url: str) -> str:
@@ -95,6 +110,9 @@ def rank_search_results(query: str, results: List[dict]) -> List[dict]:
     query_lc = query.lower()
     is_news_query = any(term in _NEWS_HINTS for term in query_terms)
     is_sports_query = bool(_SPORTS_HINT_RE.search(query_lc))
+    is_product_query = any(term in _PRODUCT_QUERY_HINTS for term in query_terms) or any(
+        h in query_lc for h in ("/docs", "sdk", "api reference", "official docs")
+    )
 
     def title_score(title: str) -> float:
         if not title:
@@ -119,9 +137,39 @@ def rank_search_results(query: str, results: List[dict]) -> List[dict]:
             return 1.0
         if netloc.endswith(".edu") or netloc.endswith(".gov"):
             return 1.0
+        # Official documentation hosts beat generic .org (arxiv) for product queries.
+        path = ""
+        try:
+            path = urlparse(url).path.lower()
+        except Exception:
+            path = ""
+        if any(h in netloc for h in _DOCS_HOST_HINTS) or any(p in path for p in _DOCS_PATH_HINTS):
+            return 0.95
         if netloc.endswith(".org"):
             return 0.7
         return 0.4
+
+    def docs_quality_adjustment(title: str, snippet: str, url: str) -> float:
+        """Boost primary docs and gently demote discussion sites for product queries."""
+        if not is_product_query:
+            return 0.0
+        u = (url or "").lower()
+        netloc = _domain(url)
+        path = ""
+        try:
+            path = urlparse(url).path.lower()
+        except Exception:
+            path = ""
+        adjustment = 0.0
+        if any(h in netloc for h in _DOCS_HOST_HINTS) or any(p in path for p in _DOCS_PATH_HINTS):
+            adjustment += 1.4
+        # Forum announce threads are useful corroboration, not SoT.
+        if "forum." in netloc or "/forums/" in u or netloc in _SECONDARY_DISCUSSION_DOMAINS:
+            adjustment -= 0.7
+        text = f"{title} {snippet}".lower()
+        if "official documentation" in text or "api reference" in text:
+            adjustment += 0.3
+        return adjustment
 
     def news_quality_adjustment(title: str, snippet: str, url: str) -> float:
         if not is_news_query:
@@ -157,6 +205,7 @@ def rank_search_results(query: str, results: List[dict]) -> List[dict]:
             + 1.5 * domain_score(url)
             + 1.0 * recency_score(age)
             + news_quality_adjustment(title, snippet, url)
+            + docs_quality_adjustment(title, snippet, url)
         )
         ranked.append((score, result))
 

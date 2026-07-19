@@ -42,7 +42,8 @@ cursor-sdk
 # Query-aware context compression for Deep Research extraction (Provence-style).
 # Optional: Settings → research_compression_backend=provence. Without it the
 # heuristic compressor is used (default).
-open_provence
+# NOTE: open_provence is not published on PyPI. Provence mode loads Hugging Face
+# checkpoints via transformers when available; portable builds ship heuristic only.
 
 # Matplotlib for agent python tool charts (headless Agg backend).
 # numpy is already in requirements.txt.

@@ -24486,6 +24486,17 @@ details.hwfit-serve-advanced > .hwfit-serve-checks:last-of-type {
   stroke: color-mix(in srgb, var(--accent, var(--red)) 55%, transparent);
   fill: color-mix(in srgb, var(--accent, var(--red)) 22%, var(--bg));
 }
+.research-synapse .rs-node-badge {
+  fill: color-mix(in srgb, var(--accent, var(--red)) 28%, var(--bg));
+  stroke: var(--accent, var(--red));
+  stroke-width: 1.4;
+}
+.research-synapse .rs-badge-label {
+  fill: var(--fg);
+  font-size: 8px;
+  font-weight: 700;
+  pointer-events: none;
+}
 .research-synapse .rs-node-new {
   animation: rs-pop 0.6s ease-out;
 }
@@ -37016,7 +37027,7 @@ body.research-panel-view #research-divider { display:none; }
   font-size:11px; opacity:0.6; margin-top:4px;
 }
 .research-step-log {
-  margin-top:8px; font-size:11px; max-height:180px; overflow-y:auto;
+  margin-top:8px; font-size:11px; max-height:220px; overflow-y:auto;
   border-left:2px solid color-mix(in srgb, var(--accent, var(--red)) 35%, transparent);
   padding-left:10px;
 }
@@ -37028,9 +37039,21 @@ body.research-panel-view #research-divider { display:none; }
 .research-step-title { font-weight:600; opacity:0.85; margin-bottom:2px; }
 .research-step-queries { opacity:0.65; font-size:10px; line-height:1.4; word-break:break-word; }
 .research-step-sources { opacity:0.55; font-size:10px; margin-top:2px; }
-.research-step-insights { margin-top:4px; font-size:10px; opacity:0.75; }
-.research-step-insights summary { cursor:pointer; user-select:none; }
-.research-step-insights ul { margin:4px 0 0 14px; padding:0; }
+.research-step-details,
+.research-step-insights {
+  margin-top:4px; font-size:10px; opacity:0.78;
+}
+.research-step-details summary,
+.research-step-insights summary {
+  cursor:pointer; user-select:none; opacity:0.9;
+}
+.research-step-details ul,
+.research-step-insights ul {
+  margin:4px 0 0 14px; padding:0; line-height:1.45;
+}
+.research-step-domain {
+  display:block; opacity:0.55; font-size:9px; margin-top:1px;
+}
 .research-job-queued-meta {
   font-size:10px; opacity:0.4; margin-top:2px;
 }

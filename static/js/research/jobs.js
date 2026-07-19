@@ -5,6 +5,7 @@
 let _jobs = [];
 let _apiBase = '';
 let _renderCb = null;
+let _elapsedCb = null;
 let _idCounter = 0;
 
 // Dismissed-from-panel IDs persist across reloads so Clear actually sticks.
@@ -101,6 +102,8 @@ function _parseDuration(s) {
   return m ? parseInt(m[1], 10) * 1000 : 0;
 }
 export function setRenderCallback(cb) { _renderCb = cb; }
+/** Lightweight tick for the running-job clock — must not rebuild the panel DOM. */
+export function setElapsedCallback(cb) { _elapsedCb = cb; }
 export function getJobs() { return _jobs; }
 
 export function addToQueue(query, settings) {
@@ -228,6 +231,90 @@ function _mergeProgressStep(job, d) {
   if (d.insights) entry.insights = d.insights;
   if (d.sources_preview) entry.sources_preview = d.sources_preview;
   if (d.sources_more != null) entry.sources_more = d.sources_more;
+  // Per-URL reading updates may carry title/url without a new step.
+  if (d.title || d.url) {
+    if (!entry.pages) entry.pages = [];
+    const key = d.url || d.title;
+    if (key && !entry.pages.some(p => (p.url || p.title) === key)) {
+      entry.pages.push({ title: d.title || '', url: d.url || '', domain: d.domain || '' });
+    }
+  }
+}
+
+/** Collapse bare "reading" spam and drop empty phase-only rows for the UI. */
+export function normalizeStepsForDisplay(steps) {
+  if (!Array.isArray(steps) || !steps.length) return [];
+  const out = [];
+  let readingGroup = null;
+
+  const isBarePhase = (s) => {
+    const phase = String(s.phase || '').toLowerCase();
+    const desc = String(s.description || '').trim();
+    const hasPayload = !!(
+      (Array.isArray(s.queries) && s.queries.length)
+      || (Array.isArray(s.insights) && s.insights.length)
+      || (Array.isArray(s.sources_preview) && s.sources_preview.length)
+      || (Array.isArray(s.pages) && s.pages.length)
+    );
+    if (hasPayload) return false;
+    if (!desc) return true;
+    return desc.toLowerCase() === phase;
+  };
+
+  for (const raw of steps) {
+    const s = { ...raw };
+    const phase = String(s.phase || '').toLowerCase();
+    const desc = String(s.description || '').trim();
+
+    // Fold consecutive reading milestones into one expandable group.
+    if (phase === 'reading') {
+      if (!readingGroup) {
+        readingGroup = {
+          step: s.step,
+          phase: 'reading',
+          description: desc && desc.toLowerCase() !== 'reading'
+            ? desc
+            : 'Reading sources',
+          sources_preview: Array.isArray(s.sources_preview) ? [...s.sources_preview] : [],
+          sources_more: s.sources_more || 0,
+          pages: Array.isArray(s.pages) ? [...s.pages] : [],
+          round: s.round,
+        };
+        out.push(readingGroup);
+      } else {
+        if (desc && desc.toLowerCase() !== 'reading') readingGroup.description = desc;
+        if (s.sources_more > (readingGroup.sources_more || 0)) {
+          readingGroup.sources_more = s.sources_more;
+        }
+        for (const sp of (s.sources_preview || [])) {
+          const key = sp.url || sp.domain;
+          if (key && !readingGroup.sources_preview.some(x => (x.url || x.domain) === key)) {
+            readingGroup.sources_preview.push(sp);
+          }
+        }
+        for (const p of (s.pages || [])) {
+          const key = p.url || p.title;
+          if (key && !readingGroup.pages.some(x => (x.url || x.title) === key)) {
+            readingGroup.pages.push(p);
+          }
+        }
+      }
+      // Still bare after merge with no pages/preview — drop later.
+      continue;
+    }
+
+    readingGroup = null;
+    if (isBarePhase(s)) continue;
+    out.push(s);
+  }
+
+  return out.filter((s) => {
+    const phase = String(s.phase || '').toLowerCase();
+    if (phase !== 'reading') return true;
+    const hasPages = (s.pages && s.pages.length) || (s.sources_preview && s.sources_preview.length);
+    const desc = String(s.description || '').trim();
+    return hasPages || (desc && desc.toLowerCase() !== 'reading');
+  });
 }
 
 function _makeJob(query, settings) {
@@ -276,7 +363,8 @@ async function _launchJob(job) {
 function _connectStream(job) {
   job._timerInterval = setInterval(() => {
     job.elapsed = Date.now() - job.startedAt;
-    _notify();
+    // Do not full-rebuild the panel every second — that resets step-log scroll.
+    if (_elapsedCb) _elapsedCb(job);
   }, 1000);
 
   const es = new EventSource(`${_apiBase}/api/research/stream/${job.id}`);

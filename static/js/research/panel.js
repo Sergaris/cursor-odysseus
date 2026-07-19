@@ -213,7 +213,16 @@ export function init(apiBase, markdownMod, sessionMod) {
   _sessionModule = sessionMod;
   jobs.init(apiBase);
   jobs.setRenderCallback(_renderJobs);
+  jobs.setElapsedCallback(_patchElapsedDisplay);
   jobs.onComplete(() => { if (!_open) _showBadge(); });
+}
+
+/** Update only the running-job clock — avoids wiping .research-step-log scroll. */
+function _patchElapsedDisplay(job) {
+  if (!job?.id) return;
+  const card = document.querySelector(`.research-job-card[data-job-id="${CSS.escape(job.id)}"]`);
+  const timeEl = card?.querySelector('.research-job-time');
+  if (timeEl) timeEl.textContent = jobs.formatElapsed(job.elapsed || 0);
 }
 
 export function isOpen() { return _open; }
@@ -636,12 +645,60 @@ function _populateModels(endpointId) {
 
 // ── Job rendering ──
 
+function _captureScrollState(container) {
+  const paneBody = document.querySelector('#research-pane .research-pane-body');
+  const stepScrolls = new Map();
+  const openInsights = new Set();
+  if (container) {
+    container.querySelectorAll('.research-job-card[data-job-id]').forEach((card) => {
+      const id = card.dataset.jobId;
+      const log = card.querySelector('.research-step-log');
+      if (log) {
+        const nearBottom = log.scrollHeight - log.clientHeight - log.scrollTop < 48;
+        stepScrolls.set(id, { top: log.scrollTop, nearBottom });
+      }
+      card.querySelectorAll('.research-step-details').forEach((details, idx) => {
+        if (details.open) openInsights.add(`${id}:${idx}`);
+      });
+    });
+  }
+  return {
+    paneScroll: paneBody ? paneBody.scrollTop : 0,
+    stepScrolls,
+    openInsights,
+  };
+}
+
+function _restoreScrollState(container, state) {
+  if (!state) return;
+  const apply = () => {
+    const paneBody = document.querySelector('#research-pane .research-pane-body');
+    if (paneBody) paneBody.scrollTop = state.paneScroll;
+    if (!container) return;
+    container.querySelectorAll('.research-job-card[data-job-id]').forEach((card) => {
+      const id = card.dataset.jobId;
+      const log = card.querySelector('.research-step-log');
+      const saved = state.stepScrolls.get(id);
+      if (log && saved) {
+        log.scrollTop = saved.nearBottom ? log.scrollHeight : saved.top;
+      }
+      card.querySelectorAll('.research-step-details').forEach((details, idx) => {
+        if (state.openInsights.has(`${id}:${idx}`)) details.open = true;
+      });
+    });
+  };
+  // Restore after layout so max-height scrollboxes have real scrollHeight.
+  requestAnimationFrame(() => requestAnimationFrame(apply));
+}
+
 function _renderJobs() {
   // Keep the rail/sidebar indicator in sync on every job-state change,
   // even when the panel is closed (no container yet).
   _syncResearchRail();
   const container = document.getElementById('research-jobs-list');
   if (!container) return;
+
+  const scrollState = _captureScrollState(container);
 
   const allJobs = jobs.getJobs();
   if (!allJobs.length) {
@@ -798,6 +855,7 @@ function _renderJobs() {
 
   _addSection('active', 'Active', active);
   _addSection('past', 'Past research', recentDone.concat(past));
+  _restoreScrollState(container, scrollState);
 }
 
 /** Pick parallel vs sequential as a small popover anchored to the
@@ -862,29 +920,59 @@ function _promptParallelOrSequential(count, anchorBtn) {
 }
 
 function _renderStepLog(job) {
-  const steps = job.steps || [];
+  const rawSteps = job.steps || [];
+  const steps = jobs.normalizeStepsForDisplay(rawSteps);
   if (!steps.length) return '';
-  const completed = steps.length;
   let items = '';
-  for (const s of steps.slice(-8)) {
+  for (const s of steps.slice(-10)) {
     const title = _esc(s.description || s.phase || 'Step');
     const queries = Array.isArray(s.queries) && s.queries.length
-      ? `<div class="research-step-queries">${s.queries.map(q => `• ${_esc(q)}`).join(' ')}</div>`
+      ? `<details class="research-step-details"><summary>Queries (${s.queries.length})</summary><ul>${s.queries.map(q => `<li>${_esc(q)}</li>`).join('')}</ul></details>`
       : '';
-    let sourcesLine = '';
-    if (s.sources_preview?.length) {
-      const names = s.sources_preview.map(sp => _esc(sp.domain || sp.url || '')).join(', ');
-      const more = s.sources_more > 0 ? ` +${s.sources_more}` : '';
-      sourcesLine = `<div class="research-step-sources">${names}${more}</div>`;
+
+    const pageItems = [];
+    const seen = new Set();
+    for (const sp of (s.sources_preview || [])) {
+      const key = sp.url || sp.domain || sp.title;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      pageItems.push(sp);
     }
+    for (const p of (s.pages || [])) {
+      const key = p.url || p.title;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      pageItems.push(p);
+    }
+    const more = s.sources_more > 0 ? s.sources_more : 0;
+    let sourcesBlock = '';
+    if (pageItems.length) {
+      const lis = pageItems.map((sp) => {
+        const label = _esc(sp.title || sp.domain || sp.url || '');
+        const sub = sp.title && sp.domain ? `<span class="research-step-domain">${_esc(sp.domain)}</span>` : '';
+        return `<li>${label}${sub}</li>`;
+      }).join('');
+      const moreLabel = more > 0 ? ` +${more}` : '';
+      sourcesBlock = `<details class="research-step-details"><summary>Sources (${pageItems.length}${moreLabel})</summary><ul>${lis}</ul></details>`;
+    }
+
     let insightsBlock = '';
     if (s.insights?.length) {
       const bullets = s.insights.map(i => `<li>${_esc(i)}</li>`).join('');
-      insightsBlock = `<details class="research-step-insights"><summary>Insights</summary><ul>${bullets}</ul></details>`;
+      insightsBlock = `<details class="research-step-details research-step-insights"><summary>Insights (${s.insights.length})</summary><ul>${bullets}</ul></details>`;
     }
-    items += `<div class="research-step-item"><div class="research-step-title">${title}</div>${queries}${sourcesLine}${insightsBlock}</div>`;
+
+    // Skip rows that still have nothing useful beyond a blank phase label.
+    if (!queries && !sourcesBlock && !insightsBlock) {
+      const phase = String(s.phase || '').toLowerCase();
+      const desc = String(s.description || '').trim().toLowerCase();
+      if (!desc || desc === phase || desc === 'reading') continue;
+    }
+
+    items += `<div class="research-step-item"><div class="research-step-title">${title}</div>${queries}${sourcesBlock}${insightsBlock}</div>`;
   }
-  return `<div class="research-step-log"><div class="research-step-header">Завершено ${completed} шагов</div>${items}</div>`;
+  if (!items) return '';
+  return `<div class="research-step-log"><div class="research-step-header">${steps.length} milestones</div>${items}</div>`;
 }
 
 function _buildJobCard(job) {

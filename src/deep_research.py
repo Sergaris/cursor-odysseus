@@ -83,22 +83,30 @@ You are a research assistant planning web searches.
 Generate {num_queries} focused search queries that will help answer the question.
 {round_instruction}
 
+Prioritize PRIMARY documentation over forums, blogs, and secondary roundups.
 Use search operators when they improve depth:
-- site:github.com / site:arxiv.org / site:ietf.org for primary sources
-- filetype:pdf for reports and papers
+- Official docs first: site:<vendor-docs-host>, paths like /docs/ or /api/, docs.* / developer.* hosts
+- site:github.com for source/code/issues (supporting, not instead of vendor docs)
+- site:arxiv.org / filetype:pdf only for scientific claims — NOT for product SDK/API how-tos
 - after:YYYY-MM-DD (or year) for recent material
-- quoted "exact phrases" for rare claims
+- quoted "exact phrases" for rare API symbols
 
-Prefer diverse strategies across the set (web, academic, github, news, pdf).
+For product / SDK / API / library questions:
+- At least ONE query MUST target official docs (site: on the vendor docs host, or an explicit docs path)
+- Do NOT spend the majority of slots on arxiv/github/pdf when the answer lives in vendor docs
+- Forums and cookbooks are secondary corroboration only
+
+Prefer diverse strategies across the set, but keep strategy:"web" dominant for product docs.
+Use strategy:"academic"/"github"/"pdf" only when that corpus is actually needed.
 
 CRITICAL: Reply with ONLY a JSON array — no prose, no refusal, no markdown fences.
 Preferred form (objects with strategy tags):
 [
-  {{"query": "topic site:arxiv.org", "strategy": "academic"}},
-  {{"query": "topic site:github.com/issues", "strategy": "github"}},
-  {{"query": "topic filetype:pdf", "strategy": "pdf"}},
+  {{"query": "LibraryName Client.create official docs site:docs.example.com", "strategy": "web"}},
+  {{"query": "LibraryName API reference documentation", "strategy": "web"}},
+  {{"query": "LibraryName site:github.com", "strategy": "github"}},
   {{"query": "topic after:2025-01-01", "strategy": "news"}},
-  {{"query": "plain web query", "strategy": "web"}}
+  {{"query": "scientific claim site:arxiv.org", "strategy": "academic"}}
 ]
 Also accepted: ["query one", "query two"] (strategy defaults to "web").
 """
@@ -247,6 +255,8 @@ class DeepResearcher:
         self._cancelled = False
         self._start_time: float = 0
         self._step_counter: int = 0
+        self._reading_step: int | None = None
+        self._reading_pages: list[dict[str, str]] = []
         self.queries_used: set[str] = set()
         self.urls_fetched: set[str] = set()
         self.analyzed_urls: list[dict[str, str]] = []
@@ -707,6 +717,7 @@ class DeepResearcher:
                 urls_to_fetch = rank_search_results(question, urls_to_fetch)
             except Exception as exc:
                 logger.warning("Research ranking failed, using provider order: %s", exc)
+            urls_to_fetch = self._prioritize_official_docs(urls_to_fetch, round_url_cap)
 
         selected: list[dict] = []
         for r in urls_to_fetch:
@@ -742,6 +753,21 @@ class DeepResearcher:
         if self._cancelled or self._time_exceeded():
             return all_findings
 
+        # One timeline step for the whole reading batch — not one empty
+        # "reading" row per URL (that flooded the UI with noise).
+        if selected:
+            preview = self._sources_preview_from_results(selected, limit=8)
+            self._reading_pages = list(preview)
+            self._emit(
+                phase="reading",
+                step_description=f"Reading {len(selected)} pages",
+                sources_preview=preview,
+                sources_more=max(0, len(selected) - len(preview)),
+                total_sources=len(self.urls_fetched),
+                bump_step=True,
+            )
+            self._reading_step = self._step_counter
+
         # Fetch and extract URLs with backpressure. Local model servers often
         # serialize requests behind one GPU; flooding them makes every request
         # slower and can trip the extraction timeout.
@@ -768,18 +794,29 @@ class DeepResearcher:
         try:
             strategies = getattr(self, "_query_strategies", None) or {}
             strategy = strategies.get(query, "web")
+            specialty_hits: list[dict] = []
             if strategy in {"academic", "github", "pdf"}:
                 try:
                     from services.search.academic import search_academic
-                    academic_hits = await asyncio.to_thread(
+                    specialty_hits = await asyncio.to_thread(
                         search_academic, query, strategy, 10,
-                    )
-                    if academic_hits:
-                        if strategy not in self.providers_used:
-                            self.providers_used.append(strategy)
-                        return academic_hits
+                    ) or []
+                    if specialty_hits and strategy not in self.providers_used:
+                        self.providers_used.append(strategy)
                 except Exception as exc:
                     logger.warning("Academic search (%s) failed: %s", strategy, exc)
+                    specialty_hits = []
+
+            # Product/SDK/docs questions must still hit the open web. Specialty
+            # corpora (arxiv/github/pdf) alone routinely miss vendor docs like
+            # cursor.com/docs while surfacing forums and secondary roundups.
+            run_web = (
+                strategy in {"web", "news"}
+                or not specialty_hits
+                or self._query_needs_web_docs(query, strategy)
+            )
+            if not run_web:
+                return specialty_hits
 
             from src.search.providers import _get_search_settings
             from src.search.core import _call_provider, _build_provider_chain
@@ -793,11 +830,12 @@ class DeepResearcher:
 
             if provider == "disabled":
                 logger.info("Search is disabled for research")
-                return []
+                return specialty_hits
 
             # Try primary provider, then fallbacks
             chain = _build_provider_chain(provider)
             raised = False
+            web_hits: list[dict] = []
             for prov in chain:
                 try:
                     results = await asyncio.to_thread(_call_provider, prov, query, 10)
@@ -810,23 +848,36 @@ class DeepResearcher:
                         logger.info(f"Research search: {prov} returned {len(results)} results")
                         if prov not in self.providers_used:
                             self.providers_used.append(prov)
-                        return results
+                        web_hits = results
+                        break
                 except Exception as e:
                     raised = True
                     logger.warning(f"Research search: {prov} failed: {e}")
                     self._last_search_error = f"{prov}: {e}"
-            # Every provider ran but none returned results. If none of them
-            # raised, record an actionable reason here — otherwise this empty
-            # path leaves `_last_search_error` unset and the caller surfaces a
-            # bare "unknown error" (issue #344). This is exactly the SearXNG
-            # case where the service is reachable but all its engines fail, so
-            # each provider returns [] without throwing.
-            if not raised:
-                self._last_search_error = (
-                    f"no results from search provider(s): "
-                    f"{', '.join(chain) if chain else provider}"
-                )
-            return []
+            if not web_hits and not specialty_hits:
+                if not raised:
+                    self._last_search_error = (
+                        f"no results from search provider(s): "
+                        f"{', '.join(chain) if chain else provider}"
+                    )
+                return []
+
+            merged = list(specialty_hits) + list(web_hits)
+            # Dedup by normalized URL while preserving specialty-first order.
+            seen: set[str] = set()
+            deduped: list[dict] = []
+            for item in merged:
+                url = (item.get("url") or "").strip()
+                key = normalize_url(url) or url
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(item)
+            try:
+                from services.search.ranking import rank_search_results
+                return rank_search_results(query, deduped)
+            except Exception:
+                return deduped
         except Exception as e:
             logger.error(f"Search failed for '{query}': {e}")
             self._last_search_error = str(e)
@@ -836,8 +887,27 @@ class DeepResearcher:
                                  title: str) -> dict | None:
         """Fetch a URL's content and use LLM to extract relevant info."""
         display = title or url
-        self._emit(phase="reading", url=url, title=display,
-                   total_sources=len(self.urls_fetched))
+        # Live phase update only — reuses the batch "Reading N pages" step.
+        pages = list(getattr(self, "_reading_pages", []) or [])
+        try:
+            domain = urlparse(url).netloc or url
+        except Exception:
+            domain = url
+        if not any((p.get("url") == url) for p in pages):
+            pages.append({"domain": domain, "url": url, "title": display})
+            self._reading_pages = pages
+        preview = pages[:12]
+        self._emit(
+            phase="reading",
+            step_description=f"Reading {len(pages)} pages",
+            url=url,
+            title=display,
+            sources_preview=preview,
+            sources_more=max(0, len(pages) - len(preview)),
+            total_sources=len(self.urls_fetched),
+            bump_step=False,
+            step=getattr(self, "_reading_step", None),
+        )
         try:
             from src.search import fetch_webpage_content
             page = await asyncio.to_thread(fetch_webpage_content, url, 10)
@@ -1144,9 +1214,17 @@ class DeepResearcher:
         limit: int = 5,
     ) -> list[dict[str, str]]:
         """Build domain preview list for progress events."""
+        return DeepResearcher._sources_preview_from_results(round_findings, limit=limit)
+
+    @staticmethod
+    def _sources_preview_from_results(
+        results: list[dict],
+        limit: int = 5,
+    ) -> list[dict[str, str]]:
+        """Build domain/title preview list from search or finding dicts."""
         preview: list[dict[str, str]] = []
         seen_domains: set[str] = set()
-        for f in round_findings:
+        for f in results:
             url = (f.get("url") or "").strip()
             if not url:
                 continue
@@ -1157,7 +1235,11 @@ class DeepResearcher:
             if domain in seen_domains:
                 continue
             seen_domains.add(domain)
-            preview.append({"domain": domain, "url": url})
+            item: dict[str, str] = {"domain": domain, "url": url}
+            title = (f.get("title") or "").strip()
+            if title:
+                item["title"] = title
+            preview.append(item)
             if len(preview) >= limit:
                 break
         return preview
@@ -1176,10 +1258,24 @@ class DeepResearcher:
     # Helpers
     # ------------------------------------------------------------------
     def _emit(self, **kwargs):
-        """Send a progress event via the callback, if one is registered."""
-        step = getattr(self, "_step_counter", 0) + 1
-        self._step_counter = step
-        kwargs.setdefault("step", step)
+        """Send a progress event via the callback, if one is registered.
+
+        Args:
+            bump_step: When False, reuse the current step id (live phase
+                updates for the same milestone). Default True creates a new
+                timeline step. Pass ``step=`` to pin a specific step id.
+        """
+        bump_step = bool(kwargs.pop("bump_step", True))
+        pinned = kwargs.pop("step", None) if "step" in kwargs else None
+        if pinned is not None:
+            step = int(pinned)
+            self._step_counter = max(getattr(self, "_step_counter", 0), step)
+        elif bump_step:
+            step = getattr(self, "_step_counter", 0) + 1
+            self._step_counter = step
+        else:
+            step = getattr(self, "_step_counter", 0) or 1
+        kwargs["step"] = step
         # Backward compat: queries as count if list passed
         if isinstance(kwargs.get("queries"), list):
             qlist = kwargs["queries"]
@@ -1329,6 +1425,69 @@ class DeepResearcher:
         if "after:" in q or "before:" in q:
             return "news"
         return "web"
+
+    @staticmethod
+    def _query_needs_web_docs(query: str, strategy: str) -> bool:
+        """True when specialty search alone is likely to miss vendor docs."""
+        q = (query or "").lower()
+        if strategy in {"web", "news"}:
+            return True
+        markers = (
+            "sdk", "api", "documentation", "docs", "readme",
+            "/docs", "typescript sdk", "python sdk", "rest api",
+            "official docs", "api reference",
+        )
+        return any(m in q for m in markers)
+
+    @staticmethod
+    def _is_official_docs_url(url: str) -> bool:
+        """Heuristic: vendor documentation paths, not forums/blogs."""
+        u = (url or "").lower()
+        if not u:
+            return False
+        if any(bad in u for bad in (
+            "forum.", "/forums/", "reddit.com", "stackoverflow.com",
+            "medium.com", "dev.to", "blogspot.",
+        )):
+            return False
+        return any(tok in u for tok in (
+            "/docs/", "/documentation/", "/api/", "/reference/",
+            "docs.", "developer.", "developers.",
+        ))
+
+    @classmethod
+    def _prioritize_official_docs(
+        cls,
+        ranked: list[dict],
+        cap: int,
+        *,
+        min_docs: int = 2,
+    ) -> list[dict]:
+        """Keep ranking order but reserve slots for official docs URLs."""
+        if not ranked or cap <= 0:
+            return ranked
+        docs = [r for r in ranked if cls._is_official_docs_url(r.get("url", ""))]
+        if not docs:
+            return ranked
+        reserve = min(min_docs, len(docs), cap)
+        chosen: list[dict] = []
+        seen: set[int] = set()
+        for r in docs[:reserve]:
+            chosen.append(r)
+            seen.add(id(r))
+        for r in ranked:
+            if len(chosen) >= cap:
+                break
+            if id(r) in seen:
+                continue
+            chosen.append(r)
+            seen.add(id(r))
+        # Append any leftovers so callers that ignore cap still see full pool.
+        for r in ranked:
+            if id(r) in seen:
+                continue
+            chosen.append(r)
+        return chosen
 
     def _session_state_dir(self) -> Path | None:
         """Directory for per-round scratchpad serde, if session_id is set."""
